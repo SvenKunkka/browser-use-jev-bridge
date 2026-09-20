@@ -77,6 +77,21 @@ Chinese.
 - `--review` is rejected outright when stdin is not a TTY or `--json` is set,
   rather than silently degrading to "approve everything".
 
+### Over MCP
+
+The MCP server adds no security path of its own. It is the same `runTask`, the
+same gate, the same budget and the same redactor; the only addition is that an
+approval is asked over one MCP call and answered over another.
+
+- no tool accepts an `apiKey`, `token`, `cookie` or `headers` input;
+- unknown fields are rejected, so a mistyped budget is an error, not a default;
+- `approvalId` is single-use, strictly matched, and refused on replay or from
+  another session;
+- an unanswered approval is **denied** when it times out;
+- every MCP result passes through the redactor before it leaves the process;
+- stdout carries JSON-RPC only — diagnostics are on stderr, and Pi's own
+  logging is disabled.
+
 ### On the Pi leg
 
 The hook is real and installed. `PiApprovalController.hook` is handed to
@@ -109,12 +124,51 @@ actions inside a Pi cell. `history` records one entry per Pi leg, and
 `mustNotRepeat` covers Jev actions only. That is also why the fallback is
 terminal — see `docs/ARCHITECTURE.md`.
 
-## Not repeating actions
+## Not repeating actions, and knowing what may have happened
 
-Every **Jev** action that could have taken effect is recorded before the next
-observation and is carried into the handoff under `mustNotRepeat`, including
-actions where no page change was observed. Pi's internal actions are *not*
-enumerated, which is precisely why control never returns to Jev afterwards. Failure never triggers an
+An action has five possible fates, and "we do not know" is one of them:
+
+| `executionPhase` | Meaning | Recorded in history? | Safe to re-plan? |
+| --- | --- | --- | --- |
+| `preflight_failed` | refused before anything could have an effect | no — nothing reached the browser | yes |
+| `dispatch_started` | the next operation can have a side effect; written *before* it runs | yes | no |
+| `dispatched` | input was handed to the browser and the call returned | yes | no |
+| `effect_uncertain` | it may or may not have landed | yes | **no** |
+| `observed` | a post-action observation exists | yes | n/a |
+
+Three real cases produce `effect_uncertain`, and each has a test:
+
+- a `SELECT` applies its value *inside* the in-page script, before any CDP
+  input, so a change handler that navigates can interrupt the call after the
+  value was set and `change` already fired;
+- a click or a fill is several CDP calls in one cell, so the mouse press can
+  land and `Input.insertText` can then fail;
+- the run deadline can fire between those calls.
+
+An uncertain action is never retried and never re-planned: the run hands over
+to Pi (or stops), the record and its phase trail go into `history` and the
+audit log, and the action is carried into `mustNotRepeat`.
+
+Pi's *internal* browser actions are **not enumerated**. A Pi leg is one history
+record with its step count and an explicit note saying so. That is exactly why
+control never returns to the fast path afterwards.
+
+## What "stopped" does and does not mean
+
+When a run ends with `stopped_by_approval` (CLI exit 3, MCP state `blocked`):
+
+- **only the declined action** is known not to have been dispatched;
+- **earlier steps in the same run may already have changed the page** — read
+  `history` / `steps` and the audit log to see which;
+- if the run had already reached Browser Use Pi, its internal actions are not
+  enumerated, so what happened inside that leg cannot be reconstructed from the
+  record;
+- a re-run is **not** automatically safe. Inspect the live page first. A second
+  run plans from scratch and can repeat something that already took effect.
+
+The only case in which nothing at all was dispatched is an approval that was
+refused before any action ran — visible as an empty `history` and a single
+approval record in the audit log. `browser_fast_status` shows both. Failure never triggers an
 automatic replay: a stale page means observe again, an unsafe action means hand
 over, and a rejected CDP call is treated as *possibly executed*.
 
@@ -128,13 +182,32 @@ staleness, handoffs, verification and the final status.
 status must carry `verified: true`, and the file must contain no
 credential-shaped strings.
 
-## Budgets
+## Budgets and the deadline
 
 One `BudgetTracker` covers the whole run — Jev steps, Pi steps, wall clock and
 model cost. A fallback leg is offered only what is left, never the initial
-limits, and the deadline is enforced with an `AbortSignal` so an in-flight Pi
-run is cut off rather than noticed late. Cost accounting covers the Pi legs;
-the fast path's two endpoints do not report a price.
+limits. Cost accounting covers the Pi legs; the fast path's two endpoints do
+not report a price.
+
+`--timeout-ms` is a **run-level deadline**, not a per-call one. One
+`AbortSignal` is created at run start and bound to every stage:
+
+- the initial navigation, every observation, `tabCount` and both freshness
+  probes (the browser backend is bound once, so page evaluation and CDP calls
+  are covered);
+- TypeSafe decision requests **and their retry backoff**;
+- text-model requests;
+- Jev input dispatch;
+- the Pi fallback leg, and the re-observation after it;
+- the final verification call.
+
+Closing gets its own small budget (`BUJB_CLEANUP_MS`, default 10 s) so an
+already-expired deadline cannot prevent Chrome from being released. A run
+therefore overruns `--timeout-ms` by at most that cleanup allowance.
+
+An expired budget is reported as `timeout`; a caller cancelling is reported as
+`cancelled`. They are different signals and are never conflated. An action
+interrupted by the deadline is marked `effect_uncertain`.
 
 ## Reporting
 

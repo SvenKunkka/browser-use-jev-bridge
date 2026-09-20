@@ -9,7 +9,8 @@
     "node": ">=22.19"
   },
   "bin": {
-    "bu-fast": "dist/cli.js"
+    "bu-fast": "dist/cli.js",
+    "bu-fast-mcp": "dist/mcp/main.js"
   },
   "exports": {
     ".": {
@@ -32,10 +33,13 @@
     "test:unit": "npm run build:test && node --test --test-concurrency=1 .build-test/tests/unit.*.test.js",
     "test:fixtures": "npm run build:test && node --test --test-concurrency=1 .build-test/tests/integration.*.test.js",
     "smoke": "npm run build && node scripts/smoke.mjs",
+    "mcp:handshake": "node scripts/mcp-handshake.mjs",
     "doctor": "npm run build && node dist/cli.js doctor --json"
   },
   "dependencies": {
-    "@browser_use/pi": "0.1.0"
+    "@browser_use/pi": "0.1.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "4.6.5"
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "0.85.1",

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Volatile Page</title></head>
+<body>
+  <h1>Volatile Page</h1>
+  <p id="intro">Choosing "Leave immediately" navigates away from inside the change handler.</p>
+  <label for="sort">Sort order</label>
+  <select id="sort">
+    <option value="stay" selected>Stay here</option>
+    <option value="leave">Leave immediately</option>
+  </select>
+  <button id="noop" type="button">No-op</button>
+  <div id="result"></div>
+  <script>
+    document.getElementById('sort').addEventListener('change', (event) => {
+      if (event.target.value === 'leave') location.replace('order.html');
+    });
+  </script>
+</body>
+</html>

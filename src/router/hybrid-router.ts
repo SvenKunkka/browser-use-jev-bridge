@@ -30,6 +30,7 @@
 import type {
   ActionRecord,
   Decision,
+  ExecutionPhaseEvent,
   FallbackReason,
   HandoffContext,
   JevRawAction,
@@ -43,6 +44,7 @@ import { BudgetTracker } from '../budget.js';
 import type { BrowserBackend } from '../pi/session.js';
 import type { JevExecutorPort } from '../jev/executor.js';
 import { UnsafeActionError } from '../jev/executor.js';
+import { RunAbortedError } from '../errors.js';
 import { StaleDecisionError, StalePageError, assertDecisionFresh } from '../jev/freshness.js';
 import { InvalidModelResponseError, choose, type TypeSafeClient } from '../jev/policy.js';
 import { TextHelperUnavailableError, fieldContext, type TextModelClient } from '../jev/text-helper.js';
@@ -63,7 +65,7 @@ const UPLOAD_GOAL = /(upload|attach|附件|上传)/i;
 
 export interface FallbackRunner {
   readonly available: boolean;
-  run(context: HandoffContext, budget: FallbackBudget): Promise<FallbackOutcome>;
+  run(context: HandoffContext, budget: FallbackBudget, signal?: AbortSignal): Promise<FallbackOutcome>;
 }
 
 export interface RouterDependencies {
@@ -141,6 +143,10 @@ export class HybridRouter {
   private piFallbacks = 0;
   private baselineTabCount = 1;
   private pendingText: { key: string; text: string } | undefined;
+  /** Bound once at run start; every call below is made under it. */
+  private runSignal: AbortSignal | undefined;
+  private deadlineSignal: AbortSignal | undefined;
+  private lastSnapshot: JevSnapshot | undefined;
 
   constructor(private readonly deps: RouterDependencies) {
     this.budget =
@@ -165,8 +171,44 @@ export class HybridRouter {
   }
 
   async run(goal: string, startUrl: string): Promise<RunOutcome> {
-    const { config, audit, domainPolicy } = this.deps;
     const startedAt = this.now;
+    // One deadline for the whole run. Bound to the browser backend here so
+    // page evaluation, CDP calls and tab enumeration are covered too.
+    const signals = this.budget.createRunSignal(this.deps.signal);
+    this.runSignal = signals.combined;
+    this.deadlineSignal = signals.deadline;
+    this.deps.backend.setRunSignal?.(signals.combined);
+    try {
+      return await this.runGuarded(goal, startUrl, startedAt);
+    } catch (caught) {
+      // Nothing escapes without a run_end record and a structured outcome.
+      const message = this.deps.redactor.redact(
+        caught instanceof Error ? (caught.stack ?? caught.message) : String(caught),
+      );
+      this.deps.audit.write({ type: 'error', phase: 'unhandled', message });
+      const status: RunStatus = this.deadlineSignal?.aborted
+        ? 'timeout'
+        : this.deps.signal?.aborted
+          ? 'cancelled'
+          : 'error';
+      return this.finish(
+        status,
+        goal,
+        startUrl,
+        this.lastSnapshot?.url ?? startUrl,
+        startedAt,
+        { ...NOT_RUN, reasons: ['The run ended with an unhandled error; see the audit log.'] },
+        message,
+      );
+    } finally {
+      // Closing gets its own small budget so cleanup is not cut off by an
+      // already-expired run deadline.
+      this.deps.backend.setRunSignal?.(AbortSignal.timeout(Math.max(1, this.deps.config.cleanupMs)));
+    }
+  }
+
+  private async runGuarded(goal: string, startUrl: string, startedAt: number): Promise<RunOutcome> {
+    const { config, audit, domainPolicy } = this.deps;
 
     audit.write({
       type: 'run_start',
@@ -186,12 +228,21 @@ export class HybridRouter {
     } catch (caught) {
       const message = this.deps.redactor.redact(caught instanceof Error ? caught.message : String(caught));
       audit.write({ type: 'error', phase: 'startup', message });
-      return this.finish('error', goal, startUrl, startUrl, startedAt, { ...NOT_RUN, reasons: [message] }, message);
+      // A deadline during startup is a timeout, not a generic error.
+      const status: RunStatus = this.deadlineSignal?.aborted
+        ? 'timeout'
+        : this.deps.signal?.aborted
+          ? 'cancelled'
+          : 'error';
+      return this.finish(status, goal, startUrl, startUrl, startedAt, { ...NOT_RUN, reasons: [message] }, message);
     }
 
     for (;;) {
       if (this.deps.signal?.aborted) {
-        return this.conclude('error', goal, startUrl, snapshot, startedAt, 'Run cancelled.');
+        return this.conclude('cancelled', goal, startUrl, snapshot, startedAt, 'Run cancelled by the caller.');
+      }
+      if (this.deadlineSignal?.aborted) {
+        return this.conclude('timeout', goal, startUrl, snapshot, startedAt, 'The run deadline expired.');
       }
 
       const exhausted = this.budget.exhausted();
@@ -224,10 +275,13 @@ export class HybridRouter {
         const chosen = await choose(snapshot, goal, this.history, {
           client: this.deps.typeSafe,
           model: config.typesafe.model,
-          ...(this.deps.signal ? { signal: this.deps.signal } : {}),
+          ...(this.runSignal ? { signal: this.runSignal } : {}),
         });
         decision = chosen.decision;
       } catch (caught) {
+        if (caught instanceof RunAbortedError) {
+          return this.conclude(this.abortStatus(caught), goal, startUrl, snapshot, startedAt, caught.message);
+        }
         const message = this.deps.redactor.redact(caught instanceof Error ? caught.message : String(caught));
         audit.write({ type: 'error', phase: 'decide', message });
         if (this.canFallback()) {
@@ -299,7 +353,13 @@ export class HybridRouter {
         continue;
       }
       if (stepResult.kind === 'fallback') {
-        return this.concludeViaFallback(goal, startUrl, snapshot, stepResult.reason, startedAt);
+        return this.concludeViaFallback(
+          goal,
+          startUrl,
+          stepResult.snapshot ?? snapshot,
+          stepResult.reason,
+          startedAt,
+        );
       }
 
       snapshot = stepResult.snapshot;
@@ -317,6 +377,7 @@ export class HybridRouter {
 
   private async observe(): Promise<JevSnapshot> {
     const snapshot = await this.deps.executor.observe();
+    this.lastSnapshot = snapshot;
     this.deps.onUrlChange?.(snapshot.url);
     this.deps.audit.write({
       type: 'observation',
@@ -344,7 +405,7 @@ export class HybridRouter {
   ): Promise<
     | { kind: 'executed'; snapshot: JevSnapshot }
     | { kind: 'stale'; snapshot: JevSnapshot }
-    | { kind: 'fallback'; reason: FallbackReason }
+    | { kind: 'fallback'; reason: FallbackReason; snapshot?: JevSnapshot }
     | { kind: 'stopped'; status: RunStatus; error?: string }
   > {
     const { config, redactor, audit } = this.deps;
@@ -391,7 +452,7 @@ export class HybridRouter {
         } else {
           const generated = await this.deps.textModel.complete(
             context,
-            ...(this.deps.signal ? [this.deps.signal] : []),
+            ...(this.runSignal ? [this.runSignal] : []),
           );
           text = generated.text;
           this.pendingText = { key, text };
@@ -456,19 +517,105 @@ export class HybridRouter {
     }
 
     const startedAt = this.now;
+
+    // The record is created at the FIRST phase that could have a side effect,
+    // not after act() returns. A dispatch that throws half-way must still be
+    // in history and in the audit log.
+    let record: ActionRecord | undefined;
+    const ensureRecord = (event: ExecutionPhaseEvent): ActionRecord => {
+      if (record) return record;
+      record = {
+        step: this.history.length + 1,
+        source: 'jev',
+        operation: decision.operation,
+        kind: action.kind,
+        actionId: action.id,
+        label: action.label,
+        url: snapshot.url,
+        ...(textSummary ? { textSummary } : {}),
+        risk: assessment.risk,
+        approved: needsPrompt ? true : undefined,
+        pageChanged: null,
+        fingerprintBefore: snapshot.fingerprint,
+        startedAt,
+        finishedAt: event.at,
+        effectUncertain: event.effectPossible,
+        executionPhase: event.phase,
+        phases: [],
+      };
+      this.history.push(record);
+      audit.write({ type: 'execution', phase: 'record_opened', ...record });
+      return record;
+    };
+
+    const onPhase = (event: ExecutionPhaseEvent): void => {
+      audit.write({
+        type: 'execution_phase',
+        actionId: action.id,
+        label: action.label,
+        url: snapshot.url,
+        ...event,
+      });
+      // A preflight failure is the one case where nothing reached the browser,
+      // so it is the one case that does not open a history record.
+      if (event.phase === 'preflight_failed') return;
+      const current = ensureRecord(event);
+      current.executionPhase = event.phase;
+      current.phases.push(event);
+      current.finishedAt = event.at;
+      if (event.effectPossible || event.phase === 'effect_uncertain') current.effectUncertain = true;
+    };
+
+    let failure: unknown;
     try {
-      await this.deps.executor.act(action, snapshot, text);
+      await this.deps.executor.act(action, snapshot, {
+        ...(text !== undefined ? { text } : {}),
+        onPhase,
+      });
     } catch (caught) {
-      if (caught instanceof StalePageError) {
-        this.registerStale(caught.message);
-        this.pendingText = undefined;
-        return { kind: 'stale', snapshot: await this.observe() };
+      failure = caught;
+    }
+
+    const uncertain =
+      record?.effectUncertain === true ||
+      (failure instanceof UnsafeActionError && failure.effectUncertain);
+
+    if (failure && uncertain) {
+      // Something may already have happened. This is never re-planned and
+      // never retried: the run hands over or stops.
+      const detail = redactor.redact(failure instanceof Error ? failure.message : String(failure));
+      audit.write({ type: 'error', phase: 'execute', effectUncertain: true, message: detail });
+      this.note(
+        `Action "${action.label}" may already have taken effect but could not be confirmed (${detail}). ` +
+          'The fast policy will not plan another step against this page.',
+      );
+      this.pendingText = undefined;
+      this.jevSteps += 1;
+      this.budget.recordJevStep();
+      const next = await this.observeSafely(snapshot);
+      if (record) this.closeRecord(record, snapshot, next);
+      if (failure instanceof RunAbortedError) {
+        return { kind: 'stopped', status: this.abortStatus(failure), error: detail };
       }
-      if (caught instanceof UnsafeActionError) {
-        audit.write({ type: 'error', phase: 'execute', message: caught.message });
+      return { kind: 'fallback', reason: 'uncertain_effect', snapshot: next };
+    }
+
+    if (failure) {
+      if (failure instanceof RunAbortedError) {
+        const detail = redactor.redact(failure.message);
+        audit.write({ type: 'error', phase: 'execute', aborted: true, message: detail });
+        return { kind: 'stopped', status: this.abortStatus(failure), error: detail };
+      }
+      if (failure instanceof StalePageError) {
+        this.registerStale(failure.message);
+        this.pendingText = undefined;
+        return { kind: 'stale', snapshot: await this.observeSafely(snapshot) };
+      }
+      if (failure instanceof UnsafeActionError) {
+        audit.write({ type: 'error', phase: 'execute', message: failure.message });
         return { kind: 'fallback', reason: 'decision_error' };
       }
-      throw caught;
+      throw failure;
     }
 
     this.pendingText = undefined;
@@ -476,44 +623,66 @@ export class HybridRouter {
     this.jevSteps += 1;
     this.budget.recordJevStep();
 
-    const record: ActionRecord = {
-      step: this.history.length + 1,
-      source: 'jev',
-      operation: decision.operation,
-      kind: action.kind,
-      actionId: action.id,
-      label: action.label,
-      url: snapshot.url,
-      ...(textSummary ? { textSummary } : {}),
-      risk: assessment.risk,
-      approved: needsPrompt ? true : undefined,
-      pageChanged: null,
-      fingerprintBefore: snapshot.fingerprint,
-      startedAt,
-      finishedAt: this.now,
-      effectUncertain: action.kind !== 'wait' && action.kind !== 'scroll',
-    };
-    // Recorded before observing: a navigation that interrupts the post-action
-    // observation must not erase the fact that the action was dispatched.
-    this.history.push(record);
-    audit.write({ type: 'execution', ...record });
+    // act() always reports at least one non-preflight phase on success, but a
+    // faked executor in a test might not; never lose the step.
+    const executed =
+      record ??
+      ensureRecord({
+        phase: 'dispatched',
+        detail: 'executor reported no phases; recorded conservatively',
+        effectPossible: action.kind !== 'wait' && action.kind !== 'scroll',
+        at: this.now,
+      });
 
     const next = await this.observe();
-    record.fingerprintAfter = next.fingerprint;
-    record.pageChanged = next.fingerprint !== snapshot.fingerprint;
-    audit.write({
-      type: 'execution',
-      step: record.step,
-      phase: 'observed',
-      pageChanged: record.pageChanged,
-      url: next.url,
-      fingerprintAfter: next.fingerprint,
-    });
+    this.closeRecord(executed, snapshot, next);
 
-    if (action.kind === 'wait' || record.pageChanged) this.noProgress = 0;
+    if (action.kind === 'wait' || executed.pageChanged) this.noProgress = 0;
     else this.noProgress += 1;
 
     return { kind: 'executed', snapshot: next };
+  }
+
+  /** Attach the post-action observation to a record and mark it observed. */
+  private closeRecord(record: ActionRecord, before: JevSnapshot, after: JevSnapshot): void {
+    record.fingerprintAfter = after.fingerprint;
+    record.pageChanged = after.fingerprint !== before.fingerprint;
+    record.executionPhase = 'observed';
+    record.phases.push({
+      phase: 'observed',
+      detail: record.pageChanged ? 'the page changed after the action' : 'no page change observed',
+      effectPossible: record.effectUncertain,
+      at: this.now,
+    });
+    this.deps.audit.write({
+      type: 'execution',
+      step: record.step,
+      phase: 'observed',
+      executionPhase: record.executionPhase,
+      effectUncertain: record.effectUncertain,
+      pageChanged: record.pageChanged,
+      url: after.url,
+      fingerprintAfter: after.fingerprint,
+    });
+  }
+
+  /** Observe, but never let a failed observation hide an executed action. */
+  private async observeSafely(fallback: JevSnapshot): Promise<JevSnapshot> {
+    try {
+      return await this.observe();
+    } catch (error) {
+      this.deps.audit.write({
+        type: 'error',
+        phase: 'observe',
+        message: this.deps.redactor.redact(error instanceof Error ? error.message : String(error)),
+      });
+      return fallback;
+    }
+  }
+
+  private abortStatus(error: RunAbortedError): RunStatus {
+    if (error.reason === 'caller') return 'cancelled';
+    return this.budget.exhausted() === 'timeout' ? 'timeout' : 'cancelled';
   }
 
   /**
@@ -617,7 +786,7 @@ export class HybridRouter {
 
     let outcome: FallbackOutcome;
     try {
-      outcome = await this.deps.fallback!.run(context, legBudget);
+      outcome = await this.deps.fallback!.run(context, legBudget, this.runSignal);
     } catch (caught) {
       const message = this.deps.redactor.redact(caught instanceof Error ? caught.message : String(caught));
       audit.write({ type: 'fallback_end', reason, status: 'error', message });
@@ -642,8 +811,16 @@ export class HybridRouter {
       startedAt: this.now,
       finishedAt: this.now,
       effectUncertain: true,
+      executionPhase: 'effect_uncertain',
+      phases: [
+        {
+          phase: 'effect_uncertain',
+          detail: 'a Pi leg ran; its individual browser actions are not enumerated',
+          effectPossible: true,
+          at: this.now,
+        },
+      ],
     };
-    this.history.push(record);
     audit.write({
       type: 'fallback_end',
       reason,
@@ -655,9 +832,20 @@ export class HybridRouter {
       budget: this.budget.report(),
     });
 
+    if (outcome.aborted) {
+      const status: RunStatus = this.deadlineSignal?.aborted ? 'timeout' : 'cancelled';
+      this.note(`The Pi fallback leg was cut off (${status}).`);
+      const cut = await this.observeSafely(snapshot);
+      record.fingerprintAfter = cut.fingerprint;
+      record.pageChanged = cut.fingerprint !== snapshot.fingerprint;
+      this.history.push(record);
+      return this.conclude(status, goal, startUrl, cut, startedAt, outcome.text);
+    }
+
+    this.history.push(record);
     const denial = this.deps.piController?.denial;
     const claimedAt = this.now;
-    const fresh = await this.observe().catch(() => snapshot);
+    const fresh = await this.observeSafely(snapshot);
     record.fingerprintAfter = fresh.fingerprint;
     record.pageChanged = fresh.fingerprint !== snapshot.fingerprint;
 
@@ -713,7 +901,7 @@ export class HybridRouter {
       domainPolicy: this.deps.domainPolicy,
       thresholds: this.deps.config.verification,
       ...(claimedAt !== undefined ? { claimedAt } : {}),
-      ...(this.deps.signal ? { signal: this.deps.signal } : {}),
+      ...(this.runSignal ? { signal: this.runSignal } : {}),
     });
     this.deps.audit.write({ type: 'verification', ...verification });
     return verification;

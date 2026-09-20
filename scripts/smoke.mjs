@@ -10,6 +10,8 @@
  *   [pi]       a genuine Browser Use Pi fallback leg, driven by a scripted
  *              streamFn, with its approval hook installed
  *   [approval] a high-risk Pi tool call refused by default, then allowed once approved
+ *   [mcp]      the real MCP stdio server: listTools, an approval round trip,
+ *              a denial and an idempotent cancel, driven by the official SDK client
  *
  * Everything runs against a throwaway headless Chromium on file:// fixtures.
  * No network request leaves the machine and no paid endpoint is contacted.
@@ -17,9 +19,12 @@
  */
 
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
+
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
 
 import { JevExecutor } from '../dist/jev/executor.js';
 import { HybridRouter } from '../dist/router/hybrid-router.js';
@@ -59,6 +64,71 @@ async function step(section, name, run) {
     failures++;
     log(`FAIL  [${section}] ${name}: ${error instanceof Error ? error.message : String(error)}`);
   }
+}
+
+// --- [mcp] helpers ---------------------------------------------------------
+
+const MCP_TEST_SERVER = resolve(process.cwd(), 'dist/testing/mcp-test-server.js');
+
+/** A real MCP client attached to the real server over a real stdio transport. */
+async function startMcp(plan, extraEnv = {}) {
+  if (!existsSync(MCP_TEST_SERVER)) throw new Error(`build first: ${MCP_TEST_SERVER} is missing`);
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [MCP_TEST_SERVER],
+    cwd: process.cwd(),
+    env: {
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+      BUJB_TEST_PLAN: JSON.stringify(plan),
+      BUJB_CDP_URL: chrome.cdpUrl,
+      BUJB_BROWSER: 'chrome',
+      BUJB_WORKSPACE: workspace,
+      BUJB_TELEMETRY: '0',
+      BUJB_RECORD: '0',
+      DO_NOT_TRACK: '1',
+      ...extraEnv,
+    },
+    stderr: 'pipe',
+  });
+  const client = new Client({ name: 'bujb-smoke', version: '1' });
+  await client.connect(transport);
+  return {
+    client,
+    async close() {
+      await client.close().catch(() => {});
+    },
+  };
+}
+
+async function mcpCall(client, name, args = {}) {
+  let result;
+  try {
+    result = await client.callTool({ name, arguments: args });
+  } catch (error) {
+    // Schema violations are rejected by the SDK before the handler runs. That
+    // is still a refusal, so report it the same way.
+    return { isError: true, text: String(error), json: {} };
+  }
+  const text = result.content.map((entry) => entry.text).join('');
+  let json;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = { raw: text };
+  }
+  return { isError: Boolean(result.isError), text, json };
+}
+
+async function mcpPoll(client, sessionId, predicate, timeoutMs = 45_000) {
+  const deadline = Date.now() + timeoutMs;
+  let last = {};
+  while (Date.now() < deadline) {
+    last = (await mcpCall(client, 'browser_fast_status', { sessionId })).json;
+    if (predicate(last)) return last;
+    await new Promise((done) => setTimeout(done, 100));
+  }
+  throw new Error(`timed out waiting for state; last = ${JSON.stringify(last).slice(0, 600)}`);
 }
 
 /** One Pi fallback leg on the order fixture, with the approval hook installed. */
@@ -230,6 +300,135 @@ try {
     assert.equal(gate.seen.length, 1);
     assert.equal(controller.denial, undefined);
     assert.equal(result, 'ORDER PLACED', 'the approved action really reached the page');
+  });
+
+  // -- [mcp] ---------------------------------------------------------------
+  // A real MCP stdio transport and the real SDK client against the real
+  // server; only the two paid model endpoints are scripted.
+  await step('mcp', 'initialize and listTools over a real stdio transport', async () => {
+    const harness = await startMcp({});
+    try {
+      const listed = await harness.client.listTools();
+      const names = listed.tools.map((tool) => tool.name).sort();
+      assert.deepEqual(names, [
+        'browser_fast_approve',
+        'browser_fast_cancel',
+        'browser_fast_doctor',
+        'browser_fast_list_sessions',
+        'browser_fast_start',
+        'browser_fast_status',
+        'browser_fast_verify',
+      ]);
+      const doctor = await mcpCall(harness.client, 'browser_fast_doctor', {});
+      assert.equal(doctor.isError, false, doctor.text);
+      assert.ok(typeof doctor.json.status === 'string');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  await step('mcp', 'start -> awaiting_approval -> approve -> completed', async () => {
+    const harness = await startMcp({
+      typeSafe: [
+        { operation: 'CLICK', targetLabel: 'Place order' },
+        { operation: 'DONE' },
+        { verdict: 'SATISFIED' },
+      ],
+    });
+    try {
+      const started = await mcpCall(harness.client, 'browser_fast_start', {
+        url: fixtureUrl('order.html'),
+        goal: 'place the order',
+        maxSteps: 6,
+        timeoutMs: 60_000,
+      });
+      assert.equal(started.isError, false, started.text);
+      const sessionId = started.json.sessionId;
+      assert.ok(String(sessionId).startsWith('bfh_'));
+
+      const waiting = await mcpPoll(harness.client, sessionId, (value) => value.state === 'awaiting_approval');
+      const pending = waiting.pendingApproval;
+      assert.equal(pending.risk, 'high');
+      const approved = await mcpCall(harness.client, 'browser_fast_approve', {
+        sessionId,
+        approvalId: pending.approvalId,
+        approved: true,
+      });
+      assert.equal(approved.isError, false, approved.text);
+
+      const final = await mcpPoll(harness.client, sessionId, (value) =>
+        ['completed', 'unverified', 'blocked', 'failed', 'timeout'].includes(value.state),
+      );
+      assert.equal(final.state, 'completed', JSON.stringify(final.notes));
+      assert.equal(final.outcome.history.filter((entry) => entry.source === 'jev').length, 1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  await step('mcp', 'declining stops the run and the declined action never executes', async () => {
+    const harness = await startMcp({ typeSafe: [{ operation: 'CLICK', targetLabel: 'Place order' }] });
+    try {
+      const started = await mcpCall(harness.client, 'browser_fast_start', {
+        url: fixtureUrl('order.html'),
+        goal: 'place the order',
+        maxSteps: 6,
+        timeoutMs: 60_000,
+      });
+      const sessionId = started.json.sessionId;
+      const waiting = await mcpPoll(harness.client, sessionId, (value) => value.state === 'awaiting_approval');
+      const declined = await mcpCall(harness.client, 'browser_fast_approve', {
+        sessionId,
+        approvalId: waiting.pendingApproval.approvalId,
+        approved: false,
+        reason: 'smoke test declines high-risk actions',
+      });
+      assert.equal(declined.isError, false, declined.text);
+      const replay = await mcpCall(harness.client, 'browser_fast_approve', {
+        sessionId,
+        approvalId: waiting.pendingApproval.approvalId,
+        approved: true,
+      });
+      assert.equal(replay.isError, true, 'an approvalId is single-use');
+
+      const final = await mcpPoll(harness.client, sessionId, (value) =>
+        ['blocked', 'completed', 'unverified', 'failed'].includes(value.state),
+      );
+      assert.equal(final.state, 'blocked');
+      assert.equal(final.outcomeStatus, 'stopped_by_approval');
+      assert.equal(
+        final.outcome.history.some((entry) => /Place order/.test(entry.label)),
+        false,
+        'the declined action has no execution record',
+      );
+    } finally {
+      await harness.close();
+    }
+  });
+
+  await step('mcp', 'cancel is idempotent and leaves nothing pending', async () => {
+    const harness = await startMcp({ typeSafe: [{ operation: 'CLICK', targetLabel: 'Place order' }] });
+    try {
+      const started = await mcpCall(harness.client, 'browser_fast_start', {
+        url: fixtureUrl('order.html'),
+        goal: 'place the order',
+        maxSteps: 4,
+        timeoutMs: 60_000,
+      });
+      const sessionId = started.json.sessionId;
+      await mcpPoll(harness.client, sessionId, (value) => value.state === 'awaiting_approval');
+      assert.equal((await mcpCall(harness.client, 'browser_fast_cancel', { sessionId })).isError, false);
+      assert.equal((await mcpCall(harness.client, 'browser_fast_cancel', { sessionId })).isError, false);
+      const final = await mcpPoll(
+        harness.client,
+        sessionId,
+        (value) => !['created', 'running', 'awaiting_approval'].includes(value.state),
+      );
+      assert.ok(['cancelled', 'blocked', 'failed'].includes(final.state), String(final.state));
+      assert.equal(final.pendingApproval, null);
+    } finally {
+      await harness.close();
+    }
   });
 } catch (error) {
   failures++;

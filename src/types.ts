@@ -141,7 +141,7 @@ export interface Decision {
 
 export type ActionSource = 'jev' | 'pi';
 
-/** Append-only record of something that actually reached the browser. */
+/** Append-only record of something that reached, or may have reached, the browser. */
 export interface ActionRecord {
   step: number;
   source: ActionSource;
@@ -161,6 +161,35 @@ export interface ActionRecord {
   finishedAt: number;
   /** True when the action may already have taken effect (never auto-replay). */
   effectUncertain: boolean;
+  /** How far this action got. See ExecutionPhase. */
+  executionPhase: ExecutionPhase;
+  /** Ordered trail of phase transitions, for the audit log and for reviewers. */
+  phases: ExecutionPhaseEvent[];
+}
+
+/**
+ * How far an action got. The point of this enum is that "we do not know" is a
+ * first-class answer: an action that may already have changed the page must
+ * never be filed as "not executed" and must never be re-planned.
+ */
+export type ExecutionPhase =
+  /** Refused before anything could have a side effect. Definitely not executed. */
+  | 'preflight_failed'
+  /** The next operation can have a side effect. Recorded BEFORE it runs. */
+  | 'dispatch_started'
+  /** Input was handed to the browser and the call returned. */
+  | 'dispatched'
+  /** It may or may not have taken effect. Treat as executed. */
+  | 'effect_uncertain'
+  /** A post-action observation exists. */
+  | 'observed';
+
+export interface ExecutionPhaseEvent {
+  phase: ExecutionPhase;
+  detail: string;
+  /** True once a side effect is possible. Once true it never goes back to false. */
+  effectPossible: boolean;
+  at: number;
 }
 
 export type RiskLevel = 'low' | 'medium' | 'high';
@@ -208,6 +237,7 @@ export type FallbackReason =
   | 'decision_error'
   | 'text_helper_unavailable'
   | 'credential_field'
+  | 'uncertain_effect'
   | 'operator_request';
 
 export interface VerificationResult {
@@ -235,6 +265,7 @@ export type RunStatus =
   | 'step_limit'
   | 'timeout'
   | 'cost_limit'
+  | 'cancelled'
   | 'error';
 
 export interface RunOutcome {

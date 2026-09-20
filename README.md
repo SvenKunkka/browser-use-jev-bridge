@@ -18,6 +18,12 @@ enumerate the individual browser actions inside a Pi cell, so it cannot promise
 the fast path would not repeat one. See
 [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) § "Jev → Pi is one-way".
 
+It ships two front ends over one engine: the `bu-fast` CLI and `bu-fast-mcp`,
+a stdio MCP server built on the official SDK, so an agent such as Codex can
+start a task, watch it, and answer approval requests between calls.
+
+- MCP tool reference: [`docs/MCP.md`](docs/MCP.md)
+- Install, upgrade, uninstall: [`docs/INSTALL.md`](docs/INSTALL.md)
 - Architecture and porting notes: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - Security model and defaults: [`docs/SECURITY.md`](docs/SECURITY.md)
 - Acceptance evidence: [`docs/ACCEPTANCE.md`](docs/ACCEPTANCE.md)
@@ -60,6 +66,25 @@ To get `bu-fast` on your PATH:
 ```sh
 npm link          # or: alias bu-fast="node $PWD/dist/cli.js"
 ```
+
+To register the MCP server and the skill with Codex on this machine:
+
+```sh
+./scripts/install-local.sh --dry-run    # show exactly what would change
+./scripts/install-local.sh              # back up config.toml, then install
+./scripts/doctor-local.sh               # verify the installation
+./scripts/uninstall-local.sh            # remove only what we installed
+```
+
+The installer adds one `[mcp_servers.browser-fast-hybrid]` block between marker
+comments and one `~/.codex/skills/browser-fast-hybrid/` directory. It never
+touches the bundled `browser` plugin or any other server. If the shell running
+the installer sees this checkout at a different path than Codex will
+(a container or VM with the project bind-mounted), pass
+`--repo-root /the/path/Codex/sees`. See [`docs/INSTALL.md`](docs/INSTALL.md).
+
+Codex reads `config.toml` and the skills directory **at startup**, so an
+install is "installed, awaiting restart" until Codex is restarted.
 
 ## Configure
 
@@ -136,14 +161,38 @@ check resolves the provider from the configured model id (`openrouter/...` →
 contacted; when it is not, `doctor` says the automatic connection is **not
 verified** rather than implying a successful probe.
 
-### Budgets
+### As an MCP server
+
+```sh
+bu-fast-mcp          # stdio; stdout is JSON-RPC only, diagnostics go to stderr
+```
+
+```jsonc
+browser_fast_start  { "url": "…", "goal": "…", "review": true }   → { sessionId }
+browser_fast_status { "sessionId": "…" }                          → poll
+browser_fast_approve{ "sessionId": "…", "approvalId": "…", "approved": true }
+browser_fast_cancel { "sessionId": "…" }
+```
+
+No MCP tool accepts a credential, unknown fields are rejected, and an
+unanswered approval is denied. Full reference: [`docs/MCP.md`](docs/MCP.md).
+
+### Budgets and the deadline
 
 `--max-steps`, `--timeout-ms` and `--max-cost-usd` are **one budget for the
 whole run**. A Pi fallback leg is offered only what is left after the fast path
-has spent its share, never the original limits, and the deadline aborts an
-in-flight Pi run rather than being noticed afterwards. `RunOutcome.budget`
-reports limits, used and remaining. Cost accounting covers the Pi legs; the
-TypeSafe and text-model endpoints do not report a price.
+has spent its share, never the original limits.
+
+`--timeout-ms` is a run-level deadline bound to a single `AbortSignal`: the
+initial navigation, every observation and freshness probe, page evaluation and
+CDP calls, TypeSafe requests *and their retry backoff*, text-model requests,
+Jev input dispatch, the Pi leg, the re-observation after it, and the final
+verification call. Closing gets its own small allowance
+(`BUJB_CLEANUP_MS`, default 10 s) so cleanup is never cut off. An expired
+budget reports `timeout`; a caller cancelling reports `cancelled`.
+
+`RunOutcome.budget` reports limits, used and remaining. Cost accounting covers
+the Pi legs; the TypeSafe and text-model endpoints do not report a price.
 
 ### Exit codes
 
@@ -161,11 +210,31 @@ alongside `verification.verified: true`.
 Unknown flags are rejected, not ignored: `--max-setps 5` exits 2 rather than
 quietly running with the default budget.
 
+### After a stop, before re-running
+
+Exit 3 (and MCP `blocked` with `outcomeStatus: "stopped_by_approval"`) means
+**the declined action was not dispatched**. It does not mean the page is
+unchanged: earlier steps in the same run may already have changed it, and if
+the run reached Browser Use Pi, that leg's internal actions are not
+enumerated.
+
+Before re-running, read `history` (CLI) or `steps` (MCP). Every entry carries
+an `executionPhase` and an `effectUncertain` flag, and anything in
+`uncertainActions` must be treated as having happened. Only an empty `history`
+shows that nothing was dispatched.
+
 ## What is guaranteed, and what is not
 
 Guaranteed by construction and covered by tests:
 
 - one Pi session owns the browser; the fast path has no browser of its own;
+- an action that may have taken effect is recorded *before* the operation that
+  could cause it, carries an explicit `executionPhase`, and is never retried or
+  re-planned;
+- `--timeout-ms` is a run-level deadline covering browser calls, model calls,
+  retry backoff, the Pi leg and the verifier;
+- the MCP server adds session lifecycle and a cross-call approval channel, and
+  nothing else: same router, same gate, same budget, same redactor;
 - the Pi approval hook is installed at session creation and reads Pi 0.1.0's
   real context (`toolCall.name`, `args`) — proved at runtime by
   `tests/integration.pi-fallback.test.ts`, which drives the actual Pi agent
@@ -200,7 +269,6 @@ Not guaranteed, and stated plainly:
   the same TypeSafe provider and model id as the decision heads;
 - the in-page digests used for freshness are 64-bit-class hashes, so a
   collision could in principle mask a change (see `docs/ARCHITECTURE.md`);
-- there is no MCP server in this version;
 - this project does not sandbox anything.
 
 ## Testing
@@ -215,7 +283,8 @@ npm test             # unit + fixture integration (offline)
 npm run test:unit    # unit only, no browser needed
 npm run test:fixtures
 npm run build
-npm run smoke        # end-to-end against dist/, offline
+npm run smoke        # end-to-end against dist/, offline; [jev] [verifier] [pi] [approval] [mcp]
+npm run mcp:handshake  # initialize/listTools against the shipped bu-fast-mcp entry point
 ```
 
 The fixture tests launch a throwaway headless Chromium and attach a **real** Pi
@@ -227,8 +296,13 @@ its agent loop physically cannot contact a provider.
 agent loop** with a scripted `streamFn`, so a genuine `javascript` tool call is
 produced, the approval hook is invoked by Pi itself, and the test can assert
 that a refused high-risk call leaves the page untouched while an approved one
-does not. `npm run smoke` runs the same shape against `dist/`, with its output
-split into `[jev]`, `[verifier]`, `[pi]` and `[approval]` sections.
+does not.
+
+`tests/integration.mcp.test.ts` does the same for the MCP surface: a real stdio
+transport, the official SDK client, the real session manager, approval channel,
+router and Chromium. `npm run smoke` runs the same shapes against `dist/`, with
+its output split into `[jev]`, `[verifier]`, `[pi]`, `[approval]` and `[mcp]`
+sections.
 
 If no browser is installed the browser tests skip rather than fail; set
 `BUJB_TEST_CHROME` to point at one.
@@ -240,27 +314,19 @@ code path imports it.
 
 ## Codex integration
 
-`skill/SKILL.md` is written for an agent caller: when to use the tool, when
-`--review` is mandatory, how to read the exit codes, and how to handle each
-failure mode. `skill/install.sh <dir>` copies it into a skills directory you
-name; it refuses to overwrite anything and is never run by the build.
+The MCP server ships and is covered by protocol-level tests that drive a real
+stdio transport, the real session manager, the real router, a real Browser Use
+Pi agent loop and a real Chromium.
 
-**MCP is not implemented in this version.** The CLI is the complete, supported
-interface. The intended next-stage MCP surface, so it can be reviewed before it
-is built:
+`skill/SKILL.md` is written for an agent caller: prefer the `browser_fast_*`
+MCP tools, keep the `bu-fast` CLI for diagnostics and terminal review, when
+`review` is mandatory, how to read each state and exit code, and what to check
+before re-running after a stop.
 
-| Tool | Input | Output | Notes |
-| --- | --- | --- | --- |
-| `browser_fast_run` | `{url, goal, mode?, review?, allowedDomains?, prohibitedDomains?, maxSteps?, timeoutMs?, maxCostUsd?}` | `RunOutcome` (`src/types.ts`) | One session per call; blocks until the run ends. `review: true` requires an approval channel, i.e. `browser_fast_approve`. |
-| `browser_fast_step` | `{sessionId}` | `{snapshotDigest, decision, riskAssessment, pendingApprovalId?}` | Advances one step of an existing session. Returns *before* executing when approval is pending. |
-| `browser_fast_approve` | `{sessionId, approvalId, approved, reason?}` | `{executed: boolean, record?: ActionRecord}` | The only way a high-risk action proceeds over MCP. |
-| `browser_fast_verify` | `{sessionId}` or `{auditPath}` | `VerificationResult` | Runs the independent verifier, or re-checks a recorded log offline. |
-| `browser_fast_cancel` | `{sessionId}` | `{status}` | Cancels the Pi run and closes the session. |
-
-Building it requires session lifetime management (`sessionId` → `PiSession`),
-an approval channel that survives across tool calls, and a policy for
-abandoned sessions. None of that exists yet, and nothing in this repository
-pretends otherwise.
+`scripts/install-local.sh` does the whole local registration (server + skill).
+`skill/install.sh <dir>` copies just the skill into a directory you name.
+Neither overwrites anything it did not create, and neither is run by the
+build.
 
 ## Licence and attribution
 

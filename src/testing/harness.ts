@@ -254,7 +254,7 @@ export class ScriptedTextModelClient implements TextModelClient {
   }
 }
 
-export interface LabelStep {
+export interface LabelStep {  // exported for the MCP test server's plan
   operation?: string;
   targetLabel?: string;
   verdict?: string;

@@ -16,6 +16,8 @@ export type AuditEventType =
   | 'config'
   | 'observation'
   | 'decision'
+  | 'execution_phase'
+  | 'mcp'
   | 'risk'
   | 'approval'
   | 'execution'
@@ -37,6 +39,13 @@ export class AuditLog {
   private sequence = 0;
   readonly entries: (AuditEvent & { sequence: number; timestamp: string })[] = [];
 
+  /**
+   * `onRecord` receives every already-redacted record. The MCP layer uses it
+   * as its live progress feed, so there is exactly one place where run events
+   * are produced and exactly one redaction pass over them.
+   */
+  onRecord: ((record: AuditEvent & { sequence: number; timestamp: string }) => void) | undefined;
+
   constructor(
     directory: string,
     private readonly redactor: Redactor,
@@ -55,6 +64,11 @@ export class AuditLog {
       timestamp: new Date().toISOString(),
     };
     this.entries.push(record as AuditEvent & { sequence: number; timestamp: string });
+    try {
+      this.onRecord?.(record as AuditEvent & { sequence: number; timestamp: string });
+    } catch {
+      // A broken observer must never break the run.
+    }
     if (!this.persist) return;
     try {
       appendFileSync(this.path, `${JSON.stringify(record)}\n`, { encoding: 'utf8', mode: 0o600 });

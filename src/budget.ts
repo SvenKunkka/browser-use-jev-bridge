@@ -112,13 +112,23 @@ export class BudgetTracker {
   }
 
   /**
-   * A signal that fires when the run's wall-clock deadline passes, so an
-   * in-flight Pi run is cut off rather than only being noticed at the top of
-   * the next loop iteration.
+   * The run's signals, created once at the start.
+   *
+   * `deadline` fires when the wall-clock budget expires; `combined` also fires
+   * when the caller cancels. Every browser call, model call, retry wait and
+   * fallback leg is bound to `combined`, so `--timeout-ms` really does cover
+   * the whole run rather than only the points where the loop happens to look.
+   * Keeping them separate is what lets the router say `timeout` when the
+   * budget expired and `cancelled` when the caller pulled the plug.
    */
+  createRunSignal(caller?: AbortSignal): { deadline: AbortSignal; combined: AbortSignal } {
+    const deadline = AbortSignal.timeout(Math.max(1, this.remaining().timeMs));
+    const combined = caller ? AbortSignal.any([caller, deadline]) : deadline;
+    return { deadline, combined };
+  }
+
+  /** Back-compat alias; prefer `createRunSignal`. */
   deadlineSignal(extra?: AbortSignal): AbortSignal {
-    const remaining = Math.max(1, this.remaining().timeMs);
-    const timeout = AbortSignal.timeout(remaining);
-    return extra ? AbortSignal.any([extra, timeout]) : timeout;
+    return this.createRunSignal(extra).combined;
   }
 }

@@ -98,7 +98,7 @@ test('fixture — clicking a button changes the page and the fingerprint', { ski
 
 test('fixture — typing replaces the field value', { skip }, async () => {
   const { jev, snapshot } = await openForm();
-  await jev.act(byLabel(snapshot, 'Search query', 'fill'), snapshot, 'blue widgets');
+  await jev.act(byLabel(snapshot, 'Search query', 'fill'), snapshot, { text: 'blue widgets' });
   const value = await offline!.session.evaluateInPage<string>("document.getElementById('query').value");
   assert.equal(value, 'blue widgets');
 });
@@ -132,7 +132,7 @@ test('fixture — a whole-page change invalidates a pending fill', { skip }, asy
   const fill = byLabel(snapshot, 'Search query', 'fill');
   await offline!.session.evaluateInPage("(document.getElementById('intro').textContent = 'mutated', true)");
   assert.equal(await jev.isFresh(snapshot), false);
-  await assert.rejects(() => jev.act(fill, snapshot, 'pears'), StalePageError);
+  await assert.rejects(() => jev.act(fill, snapshot, { text: 'pears' }), StalePageError);
   const value = await offline!.session.evaluateInPage<string>("document.getElementById('query').value");
   assert.equal(value, '', 'nothing was typed after the page moved');
 });

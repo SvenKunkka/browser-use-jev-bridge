@@ -99,6 +99,24 @@ export interface RunTaskOptions {
   url: string;
   gate?: ApprovalGate;
   signal?: AbortSignal;
+  /**
+   * Live, already-redacted run events. Same stream the audit log persists, so
+   * a caller (the MCP layer) never has to reach into the router for progress.
+   */
+  onAudit?: (record: Record<string, unknown>) => void;
+  /** Called once with the audit log's path, as soon as it exists. */
+  onAuditPath?: (path: string) => void;
+  /**
+   * Test seam. Replaces ONLY the paid model transports — the TypeSafe
+   * decision endpoint, the field-text endpoint and Pi's provider request.
+   * Everything else (router, approval gate, budget, Pi's agent loop, Chrome,
+   * the verifier) is the real implementation. Never set in production.
+   */
+  testTransport?: {
+    typeSafe?: TypeSafeClient;
+    textModel?: TextModelClient;
+    piStreamFn?: unknown;
+  };
 }
 
 export async function runTask(options: RunTaskOptions): Promise<RunOutcome> {
@@ -111,18 +129,22 @@ export async function runTask(options: RunTaskOptions): Promise<RunOutcome> {
   });
   mkdirSync(config.workspace, { recursive: true });
   const audit = new AuditLog(config.workspace, redactor, randomUUID());
+  if (options.onAudit) audit.onRecord = options.onAudit as AuditLog['onRecord'];
+  options.onAuditPath?.(audit.path);
 
-  const typeSafe: TypeSafeClient | undefined = config.typesafe.apiKey
-    ? new HttpTypeSafeClient(config.typesafe.baseUrl, config.typesafe.apiKey)
-    : undefined;
-  const textModel: TextModelClient = config.textModel.apiKey
-    ? new HttpTextModelClient(
-        config.textModel.baseUrl,
-        config.textModel.apiKey,
-        config.textModel.model,
-        config.textModel.reasoning,
-      )
-    : new MissingTextModelClient();
+  const typeSafe: TypeSafeClient | undefined =
+    options.testTransport?.typeSafe ??
+    (config.typesafe.apiKey ? new HttpTypeSafeClient(config.typesafe.baseUrl, config.typesafe.apiKey) : undefined);
+  const textModel: TextModelClient =
+    options.testTransport?.textModel ??
+    (config.textModel.apiKey
+      ? new HttpTextModelClient(
+          config.textModel.baseUrl,
+          config.textModel.apiKey,
+          config.textModel.model,
+          config.textModel.reasoning,
+        )
+      : new MissingTextModelClient());
 
   const gate: ApprovalGate = options.gate ?? new DenyHighRiskGate();
 
@@ -142,18 +164,14 @@ export async function runTask(options: RunTaskOptions): Promise<RunOutcome> {
     redactor,
     domainPolicy,
     ...(config.mode === 'fast' ? {} : { beforeToolCall: controller.hook }),
+    ...(options.testTransport?.piStreamFn ? { streamFn: options.testTransport.piStreamFn as never } : {}),
   });
   try {
     const executor = new JevExecutor(session);
     const fallback =
       config.mode === 'fast'
         ? new UnavailableFallbackRunner()
-        : new PiFallbackRunner({
-            session,
-            redactor,
-            controller,
-            ...(options.signal ? { signal: options.signal } : {}),
-          });
+        : new PiFallbackRunner({ session, redactor, controller });
 
     const router = new HybridRouter({
       backend: session,

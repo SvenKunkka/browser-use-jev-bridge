@@ -45,6 +45,8 @@ export interface FallbackOutcome {
   durationMs: number;
   costUsd: number;
   blockedActions: string[];
+  /** Set when the leg ended because a signal fired rather than on its own. */
+  aborted?: 'deadline' | 'caller';
 }
 
 /** Tool calls that only deliver a result; they touch no page. */
@@ -233,6 +235,20 @@ export async function runFallback(
   } catch (error) {
     // An abort raised by the approval denial is an expected control-flow exit.
     const message = error instanceof Error ? error.message : String(error);
+    const blockedActions = deps.controller.reviewed
+      .filter((entry) => !entry.approved)
+      .map((entry) => entry.toolName);
+    if (deps.signal?.aborted) {
+      return {
+        status: 'aborted',
+        text: deps.redactor.redact(message),
+        steps: 1,
+        durationMs: Date.now() - started,
+        costUsd: 0,
+        blockedActions,
+        aborted: 'deadline',
+      };
+    }
     if (deps.controller.denial || leg.signal.aborted) {
       return {
         status: 'cancelled',
@@ -240,7 +256,7 @@ export async function runFallback(
         steps: 1,
         durationMs: Date.now() - started,
         costUsd: 0,
-        blockedActions: deps.controller.reviewed.filter((entry) => !entry.approved).map((entry) => entry.toolName),
+        blockedActions,
       };
     }
     throw error;
@@ -254,10 +270,19 @@ export class PiFallbackRunner {
   readonly available = true;
   private used = false;
 
-  constructor(private readonly deps: Omit<FallbackDependencies, 'useFollowUp' | 'budget'>) {}
+  constructor(private readonly deps: Omit<FallbackDependencies, 'useFollowUp' | 'budget' | 'signal'>) {}
 
-  async run(context: HandoffContext, budget: FallbackBudget): Promise<FallbackOutcome> {
-    const outcome = await runFallback(context, { ...this.deps, budget, useFollowUp: this.used });
+  async run(
+    context: HandoffContext,
+    budget: FallbackBudget,
+    signal?: AbortSignal,
+  ): Promise<FallbackOutcome> {
+    const outcome = await runFallback(context, {
+      ...this.deps,
+      budget,
+      useFollowUp: this.used,
+      ...(signal ? { signal } : {}),
+    });
     this.used = true;
     return outcome;
   }

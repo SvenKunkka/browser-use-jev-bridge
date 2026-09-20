@@ -2,7 +2,7 @@
 
 import { loadConfig, type BridgeConfig } from '../src/config.js';
 import { fingerprintSnapshot } from '../src/jev/freshness.js';
-import type { JevExecutorPort } from '../src/jev/executor.js';
+import type { ActOptions, JevExecutorPort } from '../src/jev/executor.js';
 import type { BrowserBackend, PageInfo } from '../src/pi/session.js';
 import type { FallbackRunner } from '../src/router/hybrid-router.js';
 import type { FallbackBudget, FallbackOutcome } from '../src/pi/fallback.js';
@@ -60,6 +60,8 @@ export class FakeExecutor implements JevExecutorPort {
   fresh = true;
   nodeFresh = true;
   actError: (() => Error) | undefined;
+  /** When true, actError is reported as a preflight failure (nothing dispatched). */
+  failBeforeDispatch = true;
 
   constructor(private readonly queue: JevSnapshot[]) {}
 
@@ -77,9 +79,22 @@ export class FakeExecutor implements JevExecutorPort {
   async isNodeFresh(): Promise<boolean> {
     return this.nodeFresh;
   }
-  async act(action: JevRawAction, _snapshot: JevSnapshot, text?: string): Promise<void> {
-    if (this.actError) throw this.actError();
-    this.executed.push(text === undefined ? { action } : { action, text });
+  async act(action: JevRawAction, _snapshot: JevSnapshot, options: ActOptions = {}): Promise<void> {
+    const effectPossible = action.kind !== 'wait' && action.kind !== 'scroll';
+    if (this.actError) {
+      // A fake that fails "before dispatch" reports a preflight failure, so
+      // the router can still treat it as safe to re-plan.
+      if (this.failBeforeDispatch) {
+        options.onPhase?.({ phase: 'preflight_failed', detail: 'fake preflight failure', effectPossible: false, at: Date.now() });
+      } else {
+        options.onPhase?.({ phase: 'dispatch_started', detail: 'fake dispatch', effectPossible, at: Date.now() });
+        options.onPhase?.({ phase: 'effect_uncertain', detail: 'fake partial dispatch', effectPossible: true, at: Date.now() });
+      }
+      throw this.actError();
+    }
+    options.onPhase?.({ phase: 'dispatch_started', detail: 'fake dispatch', effectPossible, at: Date.now() });
+    options.onPhase?.({ phase: 'dispatched', detail: 'fake dispatch complete', effectPossible, at: Date.now() });
+    this.executed.push(options.text === undefined ? { action } : { action, text: options.text });
   }
 }
 

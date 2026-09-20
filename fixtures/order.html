@@ -6,9 +6,14 @@
 <body>
   <h1>Fixture Order</h1>
   <p id="intro">A deterministic local page with one consequential control.</p>
+  <button id="ping" type="button">Ping</button>
   <button id="placeOrder" type="button">Place order</button>
+  <div id="status"></div>
   <div id="result"></div>
   <script>
+    document.getElementById('ping').addEventListener('click', () => {
+      document.getElementById('status').textContent = 'PINGED';
+    });
     document.getElementById('placeOrder').addEventListener('click', () => {
       document.getElementById('result').textContent = 'ORDER PLACED';
     });

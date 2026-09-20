@@ -5,17 +5,33 @@
  * Browser Harness onto the Pi cell backend so that a single Pi-owned tab
  * carries both policies.
  *
+ * ## Execution phases
+ *
+ * The executor tells the caller, through a typed callback, exactly how far an
+ * action got — because "the call threw" is not the same as "nothing
+ * happened". Three cases used to be indistinguishable and are now explicit:
+ *
+ *  - `SELECT` applies the value *inside* `actTargetSource`, before any CDP
+ *    input. If the change handler navigates, the evaluation can fail after the
+ *    value was already set and `change` already fired.
+ *  - A click or a fill is several CDP calls in one cell. The mouse press can
+ *    land and `Input.insertText` can then fail.
+ *  - A run-level deadline can fire between those calls.
+ *
+ * In all three the action is `effect_uncertain` and must be treated as
+ * executed: recorded, never retried, and carried into `mustNotRepeat`.
+ *
  * Ordering rules that must not be relaxed:
  *   - a CLICK or SELECT re-checks the node guard *and* the form-control page
  *     key before anything is dispatched;
- *   - after that, the in-page `actTargetSource` re-checks connectivity,
- *     visibility, disabled state, read-only state, viewport bounds and
- *     occlusion, and resolves geometry at that instant;
- *   - a failure at either layer aborts. Nothing is retried, because a click
- *     that failed its guard may still have partially taken effect.
+ *   - `actTargetSource` then re-checks connectivity, visibility, disabled and
+ *     read-only state, viewport bounds and occlusion, and resolves geometry at
+ *     that instant;
+ *   - a failure before any side effect is `preflight_failed` and is safe to
+ *     re-plan. Anything after that is not.
  */
 
-import type { JevRawAction, JevSnapshot } from '../types.js';
+import type { ExecutionPhase, ExecutionPhaseEvent, JevRawAction, JevSnapshot } from '../types.js';
 import type { BrowserBackend } from '../pi/session.js';
 import {
   MARKER_SOURCE,
@@ -26,21 +42,35 @@ import {
 } from './snapshot.js';
 import { StalePageError, fingerprintSnapshot, guardMatches } from './freshness.js';
 
+export { RunAbortedError } from '../errors.js';
+
 const OBSERVE_ATTEMPTS = 10;
+
+export class UnsafeActionError extends Error {
+  constructor(
+    message: string,
+    /** True when the action may already have taken effect. */
+    readonly effectUncertain = false,
+  ) {
+    super(message);
+    this.name = 'UnsafeActionError';
+  }
+}
+
+export type PhaseListener = (event: ExecutionPhaseEvent) => void;
+
+export interface ActOptions {
+  text?: string;
+  /** Called synchronously on every phase transition, before the next step. */
+  onPhase?: PhaseListener;
+}
 
 /** The surface the router uses. Kept narrow so it can be faked in unit tests. */
 export interface JevExecutorPort {
   observe(): Promise<JevSnapshot>;
   isFresh(snapshot: JevSnapshot): Promise<boolean>;
   isNodeFresh(snapshot: JevSnapshot, action: JevRawAction): Promise<boolean>;
-  act(action: JevRawAction, snapshot: JevSnapshot, text?: string): Promise<void>;
-}
-
-export class UnsafeActionError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'UnsafeActionError';
-  }
+  act(action: JevRawAction, snapshot: JevSnapshot, options?: ActOptions): Promise<void>;
 }
 
 const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -65,8 +95,8 @@ export class JevExecutor implements JevExecutorPort {
     if (this.afterInput) {
       const action = this.afterInput;
       this.afterInput = undefined;
-      // Read-only, and already after the action was logged: a navigation that
-      // interrupts this must never erase the record of what was executed.
+      // Read-only, and already after the action was recorded: a navigation
+      // that interrupts this must never erase what was executed.
       try {
         await this.backend.evaluateInPage<boolean>(settleSource(action));
       } catch {
@@ -133,49 +163,109 @@ export class JevExecutor implements JevExecutorPort {
   }
 
   /**
-   * Execute one observed action. Returns only after input has been dispatched.
-   * Throws StalePageError instead of adapting when the page moved.
+   * Execute one observed action, reporting every phase transition.
+   * Throws instead of adapting when the page moved; the thrown error and the
+   * phases already reported together tell the caller whether a side effect is
+   * possible.
    */
-  async act(action: JevRawAction, snapshot: JevSnapshot, text?: string): Promise<void> {
-    await this.assertFreshFor(snapshot, action);
+  async act(action: JevRawAction, snapshot: JevSnapshot, options: ActOptions = {}): Promise<void> {
+    const emit = (phase: ExecutionPhase, detail: string, effectPossible: boolean): void => {
+      options.onPhase?.({ phase, detail, effectPossible, at: Date.now() });
+    };
+    const failPreflight = (detail: string): never => {
+      emit('preflight_failed', detail, false);
+      throw new StalePageError(detail);
+    };
+
+    try {
+      await this.assertFreshFor(snapshot, action);
+    } catch (error) {
+      return failPreflight(error instanceof Error ? error.message : String(error));
+    }
 
     if (action.kind === 'wait') {
+      emit('dispatch_started', 'waiting; no input is sent', false);
       await delay(100);
+      emit('dispatched', 'wait completed', false);
       this.afterInput = undefined;
       return;
     }
 
     if (action.kind === 'scroll') {
-      await this.backend.cdp('Input.dispatchMouseEvent', {
-        type: 'mouseWheel',
-        x: Math.round(snapshot.w / 2),
-        y: Math.round(snapshot.h / 2),
-        deltaX: 0,
-        deltaY: action.delta ?? 560,
-      });
+      emit('dispatch_started', 'dispatching a scroll wheel event', false);
+      try {
+        await this.backend.cdp('Input.dispatchMouseEvent', {
+          type: 'mouseWheel',
+          x: Math.round(snapshot.w / 2),
+          y: Math.round(snapshot.h / 2),
+          deltaX: 0,
+          deltaY: action.delta ?? 560,
+        });
+      } catch (error) {
+        // Scrolling is idempotent, so a failure here is not "uncertain" in the
+        // dangerous sense, but it did reach the browser.
+        emit('effect_uncertain', `scroll dispatch failed: ${message(error)}`, false);
+        this.afterInput = action;
+        throw error;
+      }
+      emit('dispatched', 'scroll dispatched', false);
       this.afterInput = action;
       return;
     }
 
-    if (typeof action.node !== 'number') throw new UnsafeActionError('Invalid observed node');
-    if (action.kind === 'fill' && typeof text !== 'string') {
-      throw new UnsafeActionError('TYPE_TEXT reached the executor without a generated value.');
+    if (typeof action.node !== 'number') {
+      emit('preflight_failed', 'invalid observed node', false);
+      throw new UnsafeActionError('Invalid observed node', false);
+    }
+    if (action.kind === 'fill' && typeof options.text !== 'string') {
+      emit('preflight_failed', 'TYPE_TEXT reached the executor without a value', false);
+      throw new UnsafeActionError('TYPE_TEXT reached the executor without a generated value.', false);
     }
 
-    // Code-owned node ids refer to actual observed elements, never to a
-    // model-generated selector. Geometry and occlusion are resolved here.
-    const target = await this.backend.evaluateInPage<{ x: number; y: number } | null>(
-      actTargetSource(action),
-    );
-    if (target === null) {
-      if (action.kind === 'select') {
-        throw new UnsafeActionError('Dropdown execution was not confirmed; inspect before retrying.');
+    // SELECT applies the value inside this evaluation, so the side effect
+    // starts here, not at the CDP call. CLICK and TYPE_TEXT only read.
+    const selectMutates = action.kind === 'select';
+    if (selectMutates) {
+      emit('dispatch_started', 'applying the dropdown value in the page and firing input/change', true);
+    }
+
+    let target: { x: number; y: number } | null;
+    try {
+      target = await this.backend.evaluateInPage<{ x: number; y: number } | null>(
+        actTargetSource(action),
+      );
+    } catch (error) {
+      if (selectMutates) {
+        emit(
+          'effect_uncertain',
+          `the dropdown evaluation failed after it may have applied the value: ${message(error)}`,
+          true,
+        );
+        this.afterInput = action;
+        throw new UnsafeActionError(
+          'Dropdown execution was interrupted; the value may already have been applied. Inspect before retrying.',
+          true,
+        );
       }
-      throw new StalePageError('Target changed or is covered. Observe again.');
+      return failPreflight(`target resolution failed before any input: ${message(error)}`);
     }
 
-    if (action.kind === 'select') {
-      // The in-page step already applied the value and fired input/change.
+    if (target === null) {
+      if (selectMutates) {
+        // Upstream treats this as "not confirmed"; we cannot prove the value
+        // was not applied before the script bailed out.
+        emit('effect_uncertain', 'the dropdown did not confirm; the value may have been applied', true);
+        this.afterInput = action;
+        throw new UnsafeActionError(
+          'Dropdown execution was not confirmed; inspect before retrying.',
+          true,
+        );
+      }
+      return failPreflight('Target changed or is covered. Observe again.');
+    }
+
+    if (selectMutates) {
+      emit('dispatched', 'dropdown value applied and input/change fired', true);
       this.afterInput = action;
       return;
     }
@@ -189,10 +279,31 @@ export class JevExecutor implements JevExecutorPort {
       calls.push(
         { method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key: 'a', code: 'KeyA', modifiers, commands: ['selectAll'] } },
         { method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key: 'a', code: 'KeyA', modifiers } },
-        { method: 'Input.insertText', params: { text } },
+        { method: 'Input.insertText', params: { text: options.text } },
       );
     }
-    await this.backend.cdpBatch(calls);
+
+    emit(
+      'dispatch_started',
+      `dispatching ${calls.length} CDP input call(s) for ${action.kind}`,
+      true,
+    );
+    try {
+      await this.backend.cdpBatch(calls);
+    } catch (error) {
+      // One cell, several CDP calls: an earlier one may have landed.
+      emit('effect_uncertain', `input dispatch failed part-way: ${message(error)}`, true);
+      this.afterInput = action;
+      throw new UnsafeActionError(
+        `Input dispatch failed part-way and may have partially taken effect: ${message(error)}`,
+        true,
+      );
+    }
+    emit('dispatched', `${action.kind} input dispatched`, true);
     this.afterInput = action;
   }
+}
+
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

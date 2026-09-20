@@ -15,6 +15,7 @@
  */
 
 import type { ActionRecord, JevRawAction, JevSnapshot } from '../types.js';
+import { RunAbortedError } from '../errors.js';
 import { TEXT_VALUE } from './questions.js';
 
 export interface FieldContext {
@@ -100,7 +101,11 @@ export class HttpTextModelClient implements TextModelClient {
           ],
         }),
       });
-    } catch {
+    } catch (error) {
+      if (signal?.aborted || composite.aborted) {
+        throw new RunAbortedError('The run was aborted during a text-model request.');
+      }
+      if (error instanceof RunAbortedError) throw error;
       throw new TextHelperUnavailableError('Text model connection failed; nothing typed.');
     }
     if (!response.ok) {

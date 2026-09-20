@@ -19,6 +19,8 @@ export const FALLBACK_REASON_TEXT: Record<FallbackReason, string> = {
   step_limit: 'The fast policy reached its step budget.',
   decision_error: 'The fast policy could not produce a valid, executable decision.',
   text_helper_unavailable: 'A text field had to be filled but no text model is configured.',
+  uncertain_effect:
+    'A fast-path action may already have taken effect but could not be confirmed, so the fast policy must not plan another step.',
   credential_field:
     'The next field is credential-like. The fast policy never generates such a value; only named secret injection may fill it.',
   operator_request: 'The operator asked for the general-purpose fallback.',

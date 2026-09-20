@@ -5,6 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArguments, worstReadiness, selfCheck, exitCodeForOutcome } from '../src/cli.js';
 import { applyDotEnv, parseDotEnv, loadConfig, describeConfig, providerCredential } from '../src/config.js';
+import { sessionStateForOutcome } from '../src/mcp/session-manager.js';
+import type { RunStatus } from '../src/types.js';
 
 test('regression — an unknown flag is a usage error, not silently ignored', () => {
   const parsed = parseArguments(['run', '--url', 'https://x.test/', '--goal', 'g', '--max-setps', '5']);
@@ -179,4 +181,35 @@ test('the exit-code mapping is exactly what the docs promise', () => {
   assert.equal(exitCodeForOutcome({ status: 'timeout', verification: unverified }), 1);
   assert.equal(exitCodeForOutcome({ status: 'cost_limit', verification: unverified }), 1);
   assert.equal(exitCodeForOutcome({ status: 'stopped_by_approval', verification: unverified }), 3);
+});
+
+test('the CLI exit code and the MCP session state agree on every outcome', () => {
+  const verified = { verified: true } as never;
+  const unverified = { verified: false } as never;
+  const cases: { status: RunStatus; verification: never; state: string; exit: number }[] = [
+    { status: 'completed', verification: verified, state: 'completed', exit: 0 },
+    { status: 'unverified', verification: unverified, state: 'unverified', exit: 1 },
+    { status: 'blocked', verification: unverified, state: 'blocked', exit: 1 },
+    { status: 'step_limit', verification: unverified, state: 'blocked', exit: 1 },
+    { status: 'timeout', verification: unverified, state: 'timeout', exit: 1 },
+    { status: 'cost_limit', verification: unverified, state: 'cost_limit', exit: 1 },
+    { status: 'cancelled', verification: unverified, state: 'cancelled', exit: 1 },
+    { status: 'error', verification: unverified, state: 'failed', exit: 1 },
+    { status: 'stopped_by_approval', verification: unverified, state: 'blocked', exit: 3 },
+  ];
+  for (const testCase of cases) {
+    assert.equal(
+      sessionStateForOutcome(testCase.status),
+      testCase.state,
+      `MCP state for ${testCase.status}`,
+    );
+    assert.equal(
+      exitCodeForOutcome({ status: testCase.status, verification: testCase.verification }),
+      testCase.exit,
+      `CLI exit code for ${testCase.status}`,
+    );
+  }
+  // The only state that means "the goal was verified" is the only exit code 0.
+  const success = cases.filter((entry) => entry.exit === 0);
+  assert.deepEqual(success.map((entry) => entry.state), ['completed']);
 });

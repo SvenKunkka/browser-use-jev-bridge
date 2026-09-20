@@ -14,7 +14,8 @@
  */
 
 import { BrowserUse, Browser, type BrowserOptions, type RunOptions, type RunResult } from '@browser_use/pi';
-import type { BridgeConfig } from '../config.js';
+import { injectableSecrets, type BridgeConfig } from '../config.js';
+import { RunAbortedError } from '../errors.js';
 import { StalePageError } from '../jev/freshness.js';
 import { DomainPolicy } from '../safety/domains.js';
 import type { Redactor } from '../safety/redaction.js';
@@ -31,6 +32,12 @@ export interface PageInfo {
 
 /** The surface the Jev fast path is allowed to use. Nothing else reaches Chrome. */
 export interface BrowserBackend {
+  /**
+   * Bind the run's deadline/cancel signal. Every subsequent browser call is
+   * composed with it, so `--timeout-ms` covers page work, not just the model
+   * calls. Called once, by the router, at the start of a run.
+   */
+  setRunSignal?(signal: AbortSignal | undefined): void;
   evaluateInPage<T>(expression: string, timeoutMs?: number): Promise<T>;
   cdp(method: string, params?: Record<string, unknown>): Promise<unknown>;
   /** Several CDP calls inside one cell, so a press/release pair cannot be split. */
@@ -75,6 +82,8 @@ export function browserOptionsFor(config: BridgeConfig): BrowserOptions {
 }
 
 export class PiSession implements BrowserBackend {
+  private runSignal: AbortSignal | undefined;
+
   private constructor(
     readonly agent: BrowserUse,
     private readonly config: BridgeConfig,
@@ -94,6 +103,9 @@ export class PiSession implements BrowserBackend {
       telemetry: config.telemetry,
       recording: config.recording,
       maxOutputChars: 900_000,
+      // Never let Pi write to stdout: the MCP transport owns that stream, and
+      // `--json` owns it on the CLI. Our audit log is the record.
+      log: false,
       cellTimeoutMs: config.cellTimeoutMs,
       highlightActions: config.highlightActions,
       redact: config.redactValues,
@@ -101,7 +113,8 @@ export class PiSession implements BrowserBackend {
     if (config.pi.reasoning) create.reasoning = config.pi.reasoning;
     if (domainPolicy.allowed.length) create.allowedDomains = domainPolicy.allowed;
     if (domainPolicy.prohibited.length) create.prohibitedDomains = domainPolicy.prohibited;
-    if (Object.keys(config.secrets).length) create.sensitiveData = config.secrets;
+    const injectable = injectableSecrets(config);
+    if (Object.keys(injectable).length) create.sensitiveData = injectable;
     if (options.beforeToolCall) create.beforeToolCall = options.beforeToolCall;
     if (options.streamFn) create.streamFn = options.streamFn;
 
@@ -115,11 +128,22 @@ export class PiSession implements BrowserBackend {
 
   /** Run a cell and pull one JSON value out of its stdout. */
   private async cell<T>(code: string, timeoutMs?: number): Promise<T> {
+    // The run signal is checked first so an expired deadline is reported as an
+    // abort rather than as a mysterious cell failure.
+    if (this.runSignal?.aborted) {
+      throw new RunAbortedError('The run deadline expired before this browser call.', 'deadline');
+    }
     let result: Awaited<ReturnType<BrowserUse['execute']>>;
     try {
-      result = await this.agent.execute(code, { timeoutMs: timeoutMs ?? this.config.cellTimeoutMs });
+      result = await this.agent.execute(code, {
+        timeoutMs: timeoutMs ?? this.config.cellTimeoutMs,
+        ...(this.runSignal ? { signal: this.runSignal } : {}),
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      if (this.runSignal?.aborted) {
+        throw new RunAbortedError('The run was aborted during a browser call.', 'deadline');
+      }
       if (CONTEXT_LOST.test(message)) throw new StalePageError('Document changed during evaluation');
       throw new Error(this.redactor.redact(message));
     }
@@ -134,6 +158,10 @@ export class PiSession implements BrowserBackend {
       );
     }
     return JSON.parse(text.slice(start + BEGIN.length, stop)) as T;
+  }
+
+  setRunSignal(signal: AbortSignal | undefined): void {
+    this.runSignal = signal;
   }
 
   async evaluateInPage<T>(expression: string, timeoutMs?: number): Promise<T> {

@@ -49,6 +49,8 @@ export interface BridgeConfig {
   timeoutMs: number;
   maxCostUsd: number;
   cellTimeoutMs: number;
+  /** Extra time allowed for closing the browser after the run budget expires. */
+  cleanupMs: number;
   telemetry: boolean;
   recording: boolean;
   highlightActions: boolean;
@@ -60,7 +62,14 @@ export interface BridgeConfig {
   };
   /** Literal values Pi must mask in its own history, events and logs. */
   redactValues: string[];
+  /** Every named secret, for redaction. */
   secrets: Record<string, SecretBinding>;
+  /**
+   * Names of secrets that have no domain scope. Browser Use Pi refuses an
+   * unscoped secret, so these are redacted but never injected; `doctor` says
+   * so rather than letting the session fail with a cryptic error.
+   */
+  unscopedSecrets: string[];
   thresholds: {
     /** Consecutive stale/fingerprint failures before handing to Pi. */
     maxConsecutiveStale: number;
@@ -173,6 +182,7 @@ export function loadConfig(
     timeoutMs: overrides.timeoutMs ?? number(env, 'BUJB_TIMEOUT_MS', 300_000),
     maxCostUsd: overrides.maxCostUsd ?? number(env, 'BUJB_MAX_COST_USD', 1),
     cellTimeoutMs: number(env, 'BUJB_CELL_TIMEOUT_MS', 30_000),
+    cleanupMs: number(env, 'BUJB_CLEANUP_MS', 10_000),
     verification: {
       minConfidence: ratio(env, 'BUJB_VERIFY_MIN_CONFIDENCE', 0.8),
       minProbability: ratio(env, 'BUJB_VERIFY_MIN_PROBABILITY', 0.8),
@@ -182,6 +192,9 @@ export function loadConfig(
     highlightActions: flag(env, 'BUJB_HIGHLIGHT', false),
     redactValues: Object.values(secrets).map((secret) => secret.value),
     secrets,
+    unscopedSecrets: Object.entries(secrets)
+      .filter(([, secret]) => secret.domains.length === 0)
+      .map(([name]) => name),
     thresholds: {
       maxConsecutiveStale: number(env, 'BUJB_MAX_STALE', 2),
       maxNoProgress: number(env, 'BUJB_MAX_NO_PROGRESS', 3),
@@ -246,13 +259,23 @@ export function describeConfig(config: BridgeConfig): Record<string, unknown> {
       headless: config.browser.headless,
       cloudApiKey: state(config.browser.cloudApiKey),
     },
-    budgets: { maxSteps: config.maxSteps, timeoutMs: config.timeoutMs, maxCostUsd: config.maxCostUsd },
+    budgets: {
+      maxSteps: config.maxSteps,
+      timeoutMs: config.timeoutMs,
+      maxCostUsd: config.maxCostUsd,
+      cleanupMs: config.cleanupMs,
+    },
     domains: { allowed: config.allowedDomains, prohibited: config.prohibitedDomains },
     privacy: {
       telemetry: config.telemetry ? 'enabled (explicitly opted in)' : 'disabled (default)',
       recording: config.recording ? 'enabled (explicitly opted in)' : 'disabled (default)',
       highlightActions: config.highlightActions,
-      namedSecrets: Object.keys(config.secrets).map((name) => ({ name, value: 'set' })),
+      namedSecrets: Object.entries(config.secrets).map(([name, secret]) => ({
+        name,
+        value: 'set',
+        injectable: secret.domains.length > 0,
+      })),
+      unscopedSecrets: config.unscopedSecrets,
     },
     thresholds: config.thresholds,
     verification: config.verification,
@@ -392,6 +415,17 @@ export interface ProviderCredential {
   candidates: string[];
   present: string[];
   known: boolean;
+}
+
+/**
+ * The subset of named secrets Pi will accept: it requires a non-empty domain
+ * list, so an unscoped secret is deliberately withheld rather than passed in
+ * to blow up session creation.
+ */
+export function injectableSecrets(config: BridgeConfig): Record<string, SecretBinding> {
+  return Object.fromEntries(
+    Object.entries(config.secrets).filter(([, secret]) => secret.domains.length > 0),
+  );
 }
 
 export function providerCredential(modelId: string, env: NodeJS.ProcessEnv = process.env): ProviderCredential {

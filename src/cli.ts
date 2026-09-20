@@ -13,20 +13,10 @@
  * from the project's `.env`, which this CLI loads explicitly at startup.
  */
 
-import { accessSync, constants, existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { platform, release } from 'node:os';
-import { fileURLToPath, pathToFileURL } from 'node:url';
-import {
-  applyDotEnv,
-  loadConfig,
-  describeConfig,
-  providerCredential,
-  registerSecrets,
-  type BridgeMode,
-  type ConfigOverrides,
-  type DotEnvResult,
-} from './config.js';
+import { readFileSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { applyDotEnv, loadConfig, registerSecrets, type BridgeMode, type ConfigOverrides } from './config.js';
+import { doctorReport, recordDotEnv } from './doctor.js';
 import { runTask } from './index.js';
 import { DenyHighRiskGate, TerminalApprovalGate, assessRisk } from './safety/approval-policy.js';
 import { Redactor } from './safety/redaction.js';
@@ -198,8 +188,6 @@ Credentials come from the environment or from ./.env (loaded by this CLI only).
 Exit codes: 0 verified success · 1 not verified · 2 usage · 3 not approved · 4 environment.
 `;
 
-let dotenv: DotEnvResult | undefined;
-
 async function main(): Promise<number> {
   const parsed = parseArguments(process.argv.slice(2));
   if (['', 'help', '--help', '-h'].includes(parsed.command)) {
@@ -216,8 +204,9 @@ async function main(): Promise<number> {
     return EXIT_USAGE;
   }
 
-  // Explicit, documented: the CLI loads ./.env; the library entry point does not.
-  dotenv = applyDotEnv();
+  // Explicit, documented: the CLI loads ./.env exactly once; the library entry
+  // point does not. A variable already in the environment always wins.
+  recordDotEnv(applyDotEnv());
 
   switch (parsed.command) {
     case 'run':
@@ -479,11 +468,13 @@ export function selfCheck(): Check[] {
         step: 1, source: 'jev', operation: 'CLICK', kind: 'click', actionId: 'e1', label: 'Submit order',
         url: 'https://shop.example/cart', risk: 'high', pageChanged: false,
         fingerprintBefore: 'a', startedAt: 0, finishedAt: 1, effectUncertain: true,
+        executionPhase: 'observed', phases: [],
       },
       {
         step: 2, source: 'jev', operation: 'WAIT', kind: 'wait', actionId: 'wait', label: 'Wait',
         url: 'https://shop.example/cart', risk: 'low', pageChanged: false,
         fingerprintBefore: 'a', startedAt: 1, finishedAt: 2, effectUncertain: false,
+        executionPhase: 'observed', phases: [],
       },
     ];
     const entries = buildMustNotRepeat(history);
@@ -565,30 +556,12 @@ function auditChecks(path: string): Check[] {
 }
 
 // ---------------------------------------------------------------------------
-// doctor
+// doctor — the report itself lives in src/doctor.ts so the CLI and the MCP
+// server can never disagree about readiness.
 // ---------------------------------------------------------------------------
 
-const CHROME_CANDIDATES: Record<string, string[]> = {
-  darwin: [
-    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
-    '/Applications/Chromium.app/Contents/MacOS/Chromium',
-    '/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
-  ],
-  linux: ['/usr/bin/google-chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/opt/pw-browsers/chromium'],
-  win32: [
-    'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
-    'C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe',
-  ],
-};
-
-export type Readiness = 'ready' | 'partial' | 'not_ready';
-
-/** The worst of a set of readiness values. */
-export function worstReadiness(values: Readiness[]): Readiness {
-  if (values.includes('not_ready')) return 'not_ready';
-  if (values.includes('partial')) return 'partial';
-  return 'ready';
-}
+export { worstReadiness } from './doctor.js';
+export type { Readiness } from './doctor.js';
 
 async function commandDoctor(parsed: ParsedArguments): Promise<number> {
   const json = bool(parsed, 'json');
@@ -598,261 +571,20 @@ async function commandDoctor(parsed: ParsedArguments): Promise<number> {
     return EXIT_USAGE;
   }
 
-  const config = loadConfig({ mode });
-  const redactor = new Redactor();
-  registerSecrets(config, redactor);
-  const checks: Check[] = [];
-  const readiness: Readiness[] = [];
-  const blockers: string[] = [];
-
-  const [major, minor] = process.versions.node.split('.').map(Number) as [number, number, number];
-  const nodeOk = major > 22 || (major === 22 && minor >= 19);
-  checks.push({ name: 'node version', passed: nodeOk, detail: `${process.version} (@browser_use/pi requires >= 22.19)`, required: true });
-  if (!nodeOk) {
-    readiness.push('not_ready');
-    blockers.push(`Node ${process.version} is older than the required 22.19.`);
-  }
-
-  // Resolve the installed package from this file's location, not from the
-  // working directory: `bu-fast` is normally run from somewhere else. Note
-  // that @browser_use/pi's `exports` map has no `require` condition and does
-  // not expose ./package.json, so neither `require.resolve` nor
-  // `import.meta.resolve('@browser_use/pi/package.json')` can find it — the
-  // manifest has to be located on disk.
-  let piVersion = 'not installed';
-  let piOk = false;
-  {
-    let directory = dirname(fileURLToPath(import.meta.url));
-    for (let depth = 0; depth < 8; depth++) {
-      const manifestPath = join(directory, 'node_modules', '@browser_use', 'pi', 'package.json');
-      if (existsSync(manifestPath)) {
-        try {
-          const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { version?: string };
-          piVersion = manifest.version ?? 'unknown';
-          piOk = true;
-        } catch {
-          piOk = false;
-        }
-        break;
-      }
-      const parent = dirname(directory);
-      if (parent === directory) break;
-      directory = parent;
-    }
-  }
-  checks.push({ name: 'pi package', passed: piOk, detail: `@browser_use/pi ${piVersion}`, required: true });
-  if (!piOk) {
-    readiness.push('not_ready');
-    blockers.push('@browser_use/pi is not installed; run npm ci.');
-  }
-
-  // --- browser ------------------------------------------------------------
-  const candidates = [
-    ...(config.browser.executablePath ? [config.browser.executablePath] : []),
-    ...(CHROME_CANDIDATES[platform()] ?? []),
-  ];
-  const chrome = candidates.find((candidate) => existsSync(candidate));
-  const browserRequired = config.browser.kind !== 'cloud';
-  checks.push({
-    name: 'chrome available',
-    passed: Boolean(chrome) || !browserRequired,
-    detail: chrome ? `found ${chrome}` : `no Chrome/Chromium at known paths for ${platform()} ${release()}`,
-    required: browserRequired,
-  });
-  if (browserRequired && !chrome) {
-    readiness.push('not_ready');
-    blockers.push('No Chrome/Chromium was found; set BUJB_CHROME_EXECUTABLE or install one.');
-  }
-
-  const cdpUrl = config.browser.cdpUrl;
-  if (cdpUrl) {
-    let detail = 'not reachable';
-    let ok = false;
-    try {
-      const response = await fetch(`${cdpUrl.replace(/\/$/, '')}/json/version`, { signal: AbortSignal.timeout(2500) });
-      if (response.ok) {
-        const info = (await response.json()) as Record<string, string>;
-        detail = `${info['Browser'] ?? 'unknown build'} at ${cdpUrl}`;
-        ok = true;
-      } else detail = `HTTP ${response.status} from ${cdpUrl}`;
-    } catch (error) {
-      detail = `${cdpUrl}: ${error instanceof Error ? error.message : String(error)}`;
-    }
-    checks.push({ name: 'chrome remote debugging', passed: ok, detail, required: config.browser.kind === 'chrome' });
-    if (!ok && config.browser.kind === 'chrome') {
-      readiness.push('not_ready');
-      blockers.push(`BUJB_CDP_URL is set to ${cdpUrl} but nothing answered there.`);
-    }
-  } else {
-    checks.push({
-      name: 'chrome remote debugging',
-      passed: true,
-      // Not "verified": nothing was contacted, so do not imply a successful probe.
-      detail: 'not configured (no BUJB_CDP_URL); Pi would launch or attach at run time — NOT verified here',
-      required: false,
-    });
-    readiness.push('partial');
-  }
-
-  // --- credentials, per mode ----------------------------------------------
-  const typeSafeKey = Boolean(config.typesafe.apiKey);
-  const textKey = Boolean(config.textModel.apiKey);
-  const piCredential = providerCredential(config.pi.model);
-  const piKey = piCredential.present.length > 0;
-  const cloudKey = Boolean(config.browser.cloudApiKey);
-
-  const fastReady: Readiness = !typeSafeKey ? 'not_ready' : textKey ? 'ready' : 'partial';
-  const piReady: Readiness = (() => {
-    if (!piKey) return 'not_ready';
-    if (config.browser.kind === 'cloud' && !cloudKey) return 'not_ready';
-    return 'ready';
-  })();
-
-  checks.push({
-    name: 'fast path credentials',
-    passed: fastReady !== 'not_ready',
-    detail:
-      `TYPESAFE_API_KEY ${typeSafeKey ? 'set' : 'unset'}; TEXT_MODEL_API_KEY ${textKey ? 'set' : 'unset'}` +
-      (typeSafeKey ? '' : ' — the Jev fast path cannot make a decision without TypeSafe') +
-      (typeSafeKey && !textKey ? ' — TYPE_TEXT cannot run without a text model' : ''),
-    required: mode !== 'pi',
-  });
-  checks.push({
-    name: 'pi fallback credentials',
-    passed: piReady !== 'not_ready',
-    detail:
-      `model ${config.pi.model} → provider "${piCredential.provider}"${piCredential.known ? '' : ' (unknown provider; env var name is a guess)'}; ` +
-      `candidates ${piCredential.candidates.join(', ')}; ${piKey ? 'set' : 'unset'}` +
-      (config.browser.kind === 'cloud' ? `; BROWSER_USE_API_KEY ${cloudKey ? 'set' : 'unset'}` : ''),
-    required: mode !== 'fast',
-  });
-
-  if (mode === 'fast') {
-    readiness.push(fastReady);
-    if (fastReady === 'not_ready') blockers.push('TYPESAFE_API_KEY is unset, so --mode fast cannot run.');
-    if (fastReady === 'partial') blockers.push('TEXT_MODEL_API_KEY is unset: TYPE_TEXT steps will fail.');
-  } else if (mode === 'pi') {
-    readiness.push(piReady);
-    if (piReady === 'not_ready') {
-      blockers.push(
-        `No credential for the Pi model's provider "${piCredential.provider}" (${piCredential.candidates.join(' or ')}).`,
-      );
-    }
-  } else {
-    // hybrid: both legs are checked separately; neither usable means not_ready.
-    if (fastReady === 'not_ready' && piReady === 'not_ready') {
-      readiness.push('not_ready');
-      blockers.push('Neither the Jev fast path nor the Pi fallback has usable credentials.');
-    } else if (fastReady !== 'ready' || piReady !== 'ready') {
-      readiness.push('partial');
-      if (fastReady === 'not_ready') blockers.push('The Jev fast path is unusable: TYPESAFE_API_KEY is unset.');
-      if (fastReady === 'partial') blockers.push('TYPE_TEXT is unusable: TEXT_MODEL_API_KEY is unset.');
-      if (piReady === 'not_ready') blockers.push(`The Pi fallback is unusable: no ${piCredential.candidates.join('/')}.`);
-    } else readiness.push('ready');
-  }
-
-  for (const [name, present] of [
-    ['TYPESAFE_API_KEY', typeSafeKey],
-    ['TEXT_MODEL_API_KEY', textKey],
-    ['BROWSER_USE_API_KEY', cloudKey],
-    ...piCredential.candidates.map((candidate) => [candidate, Boolean(process.env[candidate])] as [string, boolean]),
-  ] as [string, boolean][]) {
-    // Only ever "set" or "unset" — never a prefix, length or fingerprint.
-    checks.push({ name: `env ${name}`, passed: present, detail: present ? 'set' : 'unset', required: false });
-  }
-
-  checks.push({
-    name: 'typesafe endpoint',
-    passed: Boolean(config.typesafe.baseUrl),
-    detail: `${config.typesafe.baseUrl} (model ${config.typesafe.model}, key ${typeSafeKey ? 'set' : 'unset'}) — not contacted`,
-    required: false,
-  });
-  checks.push({
-    name: 'text model endpoint',
-    passed: Boolean(config.textModel.baseUrl),
-    detail: `${config.textModel.baseUrl} (model ${config.textModel.model}, key ${textKey ? 'set' : 'unset'}) — not contacted`,
-    required: false,
-  });
-
-  // --- workspace, privacy, .env -------------------------------------------
-  let workspaceOk = false;
-  let workspaceDetail = '';
-  try {
-    mkdirSync(config.workspace, { recursive: true });
-    accessSync(config.workspace, constants.W_OK);
-    const probe = join(config.workspace, `.bujb-write-probe-${process.pid}`);
-    writeFileSync(probe, 'ok');
-    rmSync(probe);
-    workspaceOk = true;
-    workspaceDetail = `${config.workspace} is writable`;
-  } catch (error) {
-    workspaceDetail = `${config.workspace}: ${error instanceof Error ? error.message : String(error)}`;
-  }
-  checks.push({ name: 'workspace writable', passed: workspaceOk, detail: workspaceDetail, required: true });
-  if (!workspaceOk) {
-    readiness.push('not_ready');
-    blockers.push('The workspace directory is not writable.');
-  }
-
-  checks.push({
-    name: 'dotenv',
-    passed: true,
-    detail: dotenv?.found
-      ? `${dotenv.path}: applied ${dotenv.applied.length} name(s) [${dotenv.applied.join(', ') || 'none'}], ` +
-        `${dotenv.skipped.length} already set in the environment` +
-        (dotenv.malformedLines.length ? `, malformed lines ${dotenv.malformedLines.join(', ')}` : '')
-      : `${dotenv?.path ?? join(process.cwd(), '.env')}: not present`,
-    required: false,
-  });
-  checks.push({
-    name: 'telemetry',
-    passed: true,
-    detail: config.telemetry
-      ? 'ENABLED — explicitly opted in via BUJB_TELEMETRY'
-      : `disabled (default); DO_NOT_TRACK=${process.env['DO_NOT_TRACK'] ? 'set' : 'unset'}`,
-    required: false,
-  });
-  checks.push({
-    name: 'recording',
-    passed: true,
-    detail: config.recording ? 'ENABLED — explicitly opted in' : 'disabled (default)',
-    required: false,
-  });
-  checks.push({
-    name: 'verification thresholds',
-    passed: true,
-    detail: `minConfidence ${config.verification.minConfidence}, minProbability ${config.verification.minProbability}`,
-    required: false,
-  });
-
-  const status = worstReadiness(readiness.length ? readiness : ['ready']);
+  const report = await doctorReport(mode);
 
   if (json) {
-    process.stdout.write(
-      `${JSON.stringify(
-        {
-          status,
-          mode,
-          platform: `${platform()} ${release()}`,
-          node: process.version,
-          legs: { fast: fastReady, pi: piReady },
-          blockers,
-          checks,
-          config: describeConfig(config),
-        },
-        null,
-        2,
-      )}\n`,
-    );
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   } else {
-    for (const check of checks) {
+    for (const check of report.checks) {
       const mark = check.passed ? 'PASS' : check.required ? 'FAIL' : 'WARN';
       process.stdout.write(`${mark}  ${check.name}: ${check.detail}\n`);
     }
-    process.stdout.write(`\nmode=${mode} fast=${fastReady} pi=${piReady}\ndoctor: ${status}\n`);
-    for (const blocker of blockers) process.stdout.write(`  - ${blocker}\n`);
+    process.stdout.write(`\nmode=${report.mode} fast=${report.legs.fast} pi=${report.legs.pi}\n`);
+    process.stdout.write(`doctor: ${report.status}\n`);
+    for (const blocker of report.blockers) process.stdout.write(`  - ${blocker}\n`);
   }
-  return status === 'not_ready' ? EXIT_ENVIRONMENT : EXIT_OK;
+  return report.status === 'not_ready' ? EXIT_ENVIRONMENT : EXIT_OK;
 }
 
 /**

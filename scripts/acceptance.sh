@@ -4,6 +4,11 @@
 #
 #   ./scripts/acceptance.sh
 #
+# The MCP session/approval/cancel evidence is produced by `npm run smoke`,
+# whose [mcp] section drives a real stdio transport with the official SDK
+# client; `scripts/mcp-handshake.mjs` covers the shipped `bu-fast-mcp` entry
+# point itself.
+#
 # Run it on macOS to produce the native-macOS record (Node v26.x, arm64) that
 # a cloud session cannot produce for you. It installs nothing globally, never
 # pushes, and touches only ./node_modules, ./dist, ./.build-test and the output
@@ -43,7 +48,11 @@ capture "bu-fast verify"              node dist/cli.js verify
 capture "bu-fast doctor --mode fast"  node dist/cli.js doctor --mode fast --json
 capture "bu-fast doctor --mode hybrid" node dist/cli.js doctor --mode hybrid --json
 capture "bu-fast doctor --mode pi"    node dist/cli.js doctor --mode pi --json
+capture "mcp startup + initialize/listTools" node scripts/mcp-handshake.mjs
 capture "npm audit --omit=dev"        npm audit --omit=dev
+capture "npm pack --dry-run"          npm pack --dry-run --json
+capture "install-local --dry-run"     ./scripts/install-local.sh --dry-run --skip-deps
+capture "doctor-local"                ./scripts/doctor-local.sh
 capture "git status --short"          git status --short
 capture "git log --oneline -n 3"      git log --oneline -n 3
 

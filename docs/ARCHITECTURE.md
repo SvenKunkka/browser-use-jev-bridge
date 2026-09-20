@@ -1,9 +1,10 @@
 # Architecture
 
-> **Changed in the acceptance-fix pass:** the Pi fallback is now **terminal**
-> (one-way), the Pi approval hook is actually installed, and one budget covers
-> the whole run. Sections below reflect that; see `docs/ACCEPTANCE.md` for what
-> was wrong before.
+> **Current shape:** the Pi fallback is **terminal** (one-way), the Pi approval
+> hook is installed and typed from Pi's own signature, one budget and one
+> deadline cover the whole run, every action carries an explicit execution
+> phase, and an MCP server ships alongside the CLI. See `docs/ACCEPTANCE.md`
+> for what changed and why.
 
 ## The one rule everything else follows
 
@@ -19,16 +20,19 @@ state, and they can never race for it, because the router never runs them
 concurrently.
 
 ```
-                    ┌──────────────────────────────┐
-  CLI / Codex tool  │  bu-fast run --url --goal     │
-                    └───────────────┬──────────────┘
-                                    │
-                    ┌───────────────▼──────────────┐
-                    │        Hybrid router          │
-                    │  observe → route → decide →   │
-                    │  risk → approve → guard →     │
-                    │  execute → re-observe         │
-                    └───────┬───────────────┬───────┘
+       ┌──────────────────────────┐   ┌────────────────────────────────────┐
+       │ bu-fast (CLI)            │   │ bu-fast-mcp (MCP, stdio)           │
+       │ run / verify / doctor    │   │ start · status · approve · cancel  │
+       └────────────┬─────────────┘   └───────────────┬────────────────────┘
+                    │      one engine, two front ends │
+                    └────────────────┬────────────────┘
+                                     │
+                    ┌────────────────▼─────────────┐
+                    │        Hybrid router         │
+                    │  observe → route → decide →  │
+                    │  risk → approve → guard →    │
+                    │  execute → re-observe        │
+                    └───────┬──────────────┬───────┘
              fast path      │               │      fallback
         ┌───────────────────▼──┐     ┌──────▼─────────────────┐
         │ Jev fast policy       │     │ Browser Use Pi agent   │
@@ -57,8 +61,13 @@ concurrently.
 
 | Path | Responsibility |
 | --- | --- |
-| `src/cli.ts` | `run` / `verify` / `doctor`, strict flag parsing, `.env` loading, readiness, exit codes. No credential ever arrives as a flag. |
-| `src/budget.ts` | One `BudgetTracker` per run: Jev steps, Pi steps, wall clock, cost. |
+| `src/cli.ts` | `run` / `verify` / `doctor`, strict flag parsing, `.env` loading, exit codes. No credential ever arrives as a flag. |
+| `src/doctor.ts` | Readiness, shared by the CLI and MCP so they cannot disagree. |
+| `src/budget.ts` | One `BudgetTracker` per run: Jev steps, Pi steps, wall clock, cost, and the run-level abort signal. |
+| `src/errors.ts` | `RunAbortedError`, shared by the session and the policies. |
+| `src/mcp/server.ts` | The seven MCP tools, their strict schemas, and one redaction pass on the way out. |
+| `src/mcp/session-manager.ts` | Session lifecycle, the cross-call approval channel, TTL, concurrency and shutdown. |
+| `src/mcp/main.ts` | `bu-fast-mcp`: stdio transport, stderr logging, signal handling. |
 | `src/config.ts` | Environment → `BridgeConfig`; `describeConfig()` produces a printable form where every secret collapses to `set`/`unset`. |
 | `src/pi/session.ts` | The single owner. Wraps `BrowserUse`; exposes `evaluateInPage`, `cdp`, `cdpBatch`, `goto`, `info`, `tabCount`, `run`, `followUp`, `close`. |
 | `src/pi/fallback.ts` | `PiApprovalController` (the `beforeToolCall` hook, typed from `BrowserUse.create`), the handoff render, and the Pi leg under the *remaining* budget. |
@@ -73,7 +82,35 @@ concurrently.
 | `src/safety/*` | Domain policy, risk classification and approval gates, redaction. |
 | `src/verification/verifier.ts` | Deterministic checks plus one independent verification *call*, with confidence and probability thresholds. |
 | `src/logging/audit-log.ts` | Redacted JSONL, written synchronously. |
+| `src/testing/mcp-test-server.ts` | A real MCP server whose only substitution is the paid model transports, driven by `BUJB_TEST_PLAN`. |
 | `src/testing/harness.ts` | Offline harness: headless Chromium, a Pi session with a throwing model transport, scripted TypeSafe/text clients. |
+
+## Two front ends, one core
+
+`bu-fast` (CLI) and `bu-fast-mcp` (MCP over stdio) are two callers of the same
+`runTask`. The router, the approval policy, the budget and its deadline, the
+audit log, the redactor and the verifier are the same objects behind both, so
+there is no path where one is safer than the other.
+
+What the MCP layer adds, and all it adds:
+
+- **Session lifecycle.** A run outlives a single tool call, so it needs an id,
+  a state machine and a place to live. `SessionManager` holds at most one
+  active browser task by default, which is also what stops two tasks fighting
+  over one Chrome profile.
+- **A cross-call approval channel.** The CLI can ask a human on a terminal; MCP
+  cannot, so an approval becomes a single-use `apr_…` id published in
+  `browser_fast_status` and answered by `browser_fast_approve`. An unanswered
+  approval times out into a **denial**.
+
+What it does not add: no tool accepts a credential, no schema allows unknown
+fields, no result escapes the redactor, and no high-risk action runs without an
+answer. Session state is derived from the same redacted audit stream the CLI
+writes, so the MCP surface cannot see more than the audit log does.
+
+`src/mcp/main.ts` writes every log line to stderr and passes `log: false` to
+`BrowserUse.create`, because on stdio a single stray `console.log` would
+corrupt the JSON-RPC stream.
 
 ## One step, in order
 
@@ -132,7 +169,7 @@ back to the fast path.
 
 This is a deliberate safety choice, not an oversight. Pi's tool is "execute
 this JavaScript": a single cell can click, type and submit several times, and
-this project cannot currently enumerate those individual browser actions. That
+those individual browser actions **are not enumerated** by this project. That
 means it cannot populate `mustNotRepeat` for them. Handing control back to a
 policy that would then plan its own next click, without knowing what Pi already
 did, is exactly the "never repeat an action that may already have taken effect"
@@ -164,7 +201,16 @@ real context: `context.toolCall.name` and `context.args`.
 `tests/integration.pi-fallback.test.ts` drives the actual Pi agent loop and
 asserts that shape at runtime.
 
-## One budget for the whole run
+## Execution phases
+
+`JevExecutor.act` reports, through a typed callback, how far an action got:
+`preflight_failed`, `dispatch_started`, `dispatched`, `effect_uncertain`,
+`observed`. The router opens the history record at the **first phase that
+could have a side effect**, not after `act()` returns, so a dispatch that
+throws half-way is still recorded. `docs/SECURITY.md` has the table and the
+three real cases that produce `effect_uncertain`.
+
+## One budget and one deadline for the whole run
 
 `BudgetTracker` holds the limits and the spend:
 

@@ -19,6 +19,7 @@ import type {
   TypeSafeAnswer,
   TypeSafeResponse,
 } from '../types.js';
+import { RunAbortedError } from '../errors.js';
 import { buildActionSpace } from './action-space.js';
 import { NEXT_ACTION, TARGET } from './questions.js';
 
@@ -31,6 +32,25 @@ export interface TypeSafeRequest {
 export interface TypeSafeClient {
   readonly description: string;
   ask(body: TypeSafeRequest, signal?: AbortSignal): Promise<TypeSafeResponse>;
+}
+
+/**
+ * A sleep that respects an AbortSignal. Retry backoff inside the run budget
+ * must be interruptible, or `--timeout-ms` silently under-counts.
+ */
+export function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.reject(new RunAbortedError('Aborted before the retry wait.'));
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new RunAbortedError('Aborted during the retry wait.'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 export class InvalidModelResponseError extends Error {
@@ -238,11 +258,17 @@ export class HttpTypeSafeClient implements TypeSafeClient {
           body: JSON.stringify(body),
           signal: composite,
         });
-      } catch {
+      } catch (error) {
+        if (signal?.aborted || composite.aborted) {
+          throw new RunAbortedError('The run was aborted during a TypeSafe request.');
+        }
+        if (error instanceof RunAbortedError) throw error;
         throw new Error('Model connection failed; no action executed.');
       }
       if ([429, 503, 529].includes(response.status) && attempt < 2) {
-        await new Promise((resolve) => setTimeout(resolve, 500 * 2 ** attempt));
+        // The wait is part of the run budget: a deadline during backoff must
+        // abort, not sleep through.
+        await abortableDelay(500 * 2 ** attempt, signal);
         continue;
       }
       if (!response.ok) {
