@@ -1,0 +1,13 @@
+node_modules/
+dist/
+.build-test/
+.work/
+work/
+runs/
+*.log
+.env
+.env.*
+!.env.example
+.DS_Store
+coverage/
+.chrome-profile/

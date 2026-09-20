@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Unsupported Controls</title></head>
+<body>
+  <h1>Unsupported Controls</h1>
+  <p>This page exposes nothing the fast policy can model.</p>
+  <canvas id="board" width="300" height="160"></canvas>
+  <iframe title="embedded" srcdoc="&lt;button&gt;Inside iframe&lt;/button&gt;" width="320" height="120"></iframe>
+  <input id="attachment" type="file">
+  <div id="host"></div>
+  <script>
+    const host = document.getElementById('host');
+    const root = host.attachShadow({mode: 'open'});
+    root.innerHTML = '<button part="x">Shadow button</button>';
+  </script>
+</body>
+</html>

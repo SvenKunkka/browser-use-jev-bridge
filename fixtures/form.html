@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture Form</title>
+<style>
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 24px; }
+  .row { margin: 12px 0; }
+  #covered-wrap { position: relative; width: 240px; height: 40px; }
+  #covered { position: absolute; inset: 0; width: 240px; height: 40px; }
+  #overlay { position: absolute; inset: 0; background: rgba(0,0,0,0.6); z-index: 10; }
+  #result { margin-top: 20px; font-weight: 600; }
+</style>
+</head>
+<body>
+  <h1>Fixture Form</h1>
+  <p id="intro">A deterministic local page for offline fast-path tests.</p>
+
+  <div class="row">
+    <label for="query">Search query</label>
+    <input id="query" name="query" type="text" value="">
+  </div>
+
+  <div class="row">
+    <label for="sort">Sort order</label>
+    <select id="sort" name="sort">
+      <option value="relevance" selected>Relevance</option>
+      <option value="newest">Newest</option>
+      <option value="oldest">Oldest</option>
+    </select>
+  </div>
+
+  <div class="row">
+    <button id="search" type="button">Search</button>
+    <button id="blocked" type="button" disabled>Disabled action</button>
+  </div>
+
+  <div class="row" id="covered-wrap">
+    <button id="covered" type="button">Covered action</button>
+    <div id="overlay"></div>
+  </div>
+
+  <div id="result"></div>
+
+  <script>
+    document.getElementById('search').addEventListener('click', () => {
+      const query = document.getElementById('query').value;
+      const sort = document.getElementById('sort').value;
+      document.getElementById('result').textContent =
+        'Results for: ' + (query || '(empty)') + ' sorted by ' + sort;
+    });
+    document.getElementById('covered').addEventListener('click', () => {
+      document.getElementById('result').textContent = 'COVERED BUTTON SHOULD NEVER BE CLICKED';
+    });
+  </script>
+</body>
+</html>
