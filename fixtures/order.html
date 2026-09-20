@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Fixture Order</title>
+<style>body{font:16px/1.5 system-ui,sans-serif;margin:24px} #result{margin-top:20px;font-weight:600}</style>
+</head>
+<body>
+  <h1>Fixture Order</h1>
+  <p id="intro">A deterministic local page with one consequential control.</p>
+  <button id="placeOrder" type="button">Place order</button>
+  <div id="result"></div>
+  <script>
+    document.getElementById('placeOrder').addEventListener('click', () => {
+      document.getElementById('result').textContent = 'ORDER PLACED';
+    });
+  </script>
+</body>
+</html>

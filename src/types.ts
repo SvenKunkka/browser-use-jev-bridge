@@ -214,6 +214,8 @@ export interface VerificationResult {
   verified: boolean;
   verdict: 'SATISFIED' | 'NOT_SATISFIED' | 'INSUFFICIENT_EVIDENCE' | 'NOT_RUN';
   confidence: number | null;
+  /** Probability mass the verifier put on SATISFIED, when a verdict was obtained. */
+  satisfiedProbability?: number;
   reasons: string[];
   evidence: {
     url: string;
@@ -247,6 +249,8 @@ export interface RunOutcome {
   verification: VerificationResult;
   fallbackReasons: FallbackReason[];
   durationMs: number;
+  /** Initial, used and remaining budget for the whole run. */
+  budget?: import('./budget.js').BudgetReport;
   auditLogPath?: string;
   /** Present only for failures; already redacted. */
   error?: string;

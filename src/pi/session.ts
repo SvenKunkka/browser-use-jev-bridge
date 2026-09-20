@@ -44,11 +44,18 @@ export interface PiSessionOptions {
   config: BridgeConfig;
   redactor: Redactor;
   domainPolicy: DomainPolicy;
+  /**
+   * Pi accepts the approval hook only at session creation, so the router's
+   * per-run controller is bound here. Without this the whole Pi-side approval
+   * layer is inert.
+   */
+  beforeToolCall?: BrowserUseBeforeToolCall;
   /** Test seam: deterministic model transport so no provider is contacted. */
   streamFn?: BrowserUseOptionsStreamFn;
 }
 
 type BrowserUseOptionsStreamFn = NonNullable<Parameters<typeof BrowserUse.create>[0]['streamFn']>;
+type BrowserUseBeforeToolCall = NonNullable<Parameters<typeof BrowserUse.create>[0]['beforeToolCall']>;
 
 export function browserOptionsFor(config: BridgeConfig): BrowserOptions {
   if (config.browser.kind === 'cloud') {
@@ -95,6 +102,7 @@ export class PiSession implements BrowserBackend {
     if (domainPolicy.allowed.length) create.allowedDomains = domainPolicy.allowed;
     if (domainPolicy.prohibited.length) create.prohibitedDomains = domainPolicy.prohibited;
     if (Object.keys(config.secrets).length) create.sensitiveData = config.secrets;
+    if (options.beforeToolCall) create.beforeToolCall = options.beforeToolCall;
     if (options.streamFn) create.streamFn = options.streamFn;
 
     const agent = await BrowserUse.create(create);

@@ -24,6 +24,15 @@ Ported or re-implemented from that repository (commit fetched 2026-09-20):
 Not reused: upstream's demo inspector, static assets, benchmark scripts,
 recorded measurements and documentation images.
 
+## @earendil-works/pi-ai — MIT (dev dependency)
+
+Pinned to `0.85.1`, the exact version `@browser_use/pi@0.1.0` depends on, and
+used **only by the offline test harness**, through the public subpath export
+`@earendil-works/pi-ai/utils/event-stream`. It supplies
+`createAssistantMessageEventStream()`, which lets the test suite drive Pi's
+real agent loop from a scripted transport instead of a paid provider. No
+production code path imports it.
+
 ## browser-use/browser-use-pi (`@browser_use/pi`) — MIT
 
 Copyright (c) 2026 Browser Use. Full text: `LICENSES/browser-use-pi.LICENSE`.

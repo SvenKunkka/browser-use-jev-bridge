@@ -5,10 +5,25 @@
   "description": "Hybrid browser tool: Jev-style fast policy in front of a single Browser Use Pi session, with independent verification, approval gating and audit logging.",
   "license": "MIT",
   "type": "module",
-  "engines": { "node": ">=22.19" },
-  "bin": { "bu-fast": "dist/cli.js" },
-  "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
-  "files": ["dist", "skill", "docs", "README.md", "LICENSES"],
+  "engines": {
+    "node": ">=22.19"
+  },
+  "bin": {
+    "bu-fast": "dist/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "skill",
+    "docs",
+    "README.md",
+    "LICENSES"
+  ],
   "scripts": {
     "check": "tsc --noEmit -p tsconfig.json",
     "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsc -p tsconfig.build.json",
@@ -23,6 +38,7 @@
     "@browser_use/pi": "0.1.0"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
     "@types/node": "^22.19.0",
     "typescript": "^5.9.3"
   }

@@ -7,6 +7,7 @@
  * collapse to "set" / "unset".
  */
 
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { Redactor } from './safety/redaction.js';
@@ -51,6 +52,12 @@ export interface BridgeConfig {
   telemetry: boolean;
   recording: boolean;
   highlightActions: boolean;
+  verification: {
+    /** Minimum confidence the verifier's answer must carry. */
+    minConfidence: number;
+    /** Minimum probability mass the verifier must put on SATISFIED. */
+    minProbability: number;
+  };
   /** Literal values Pi must mask in its own history, events and logs. */
   redactValues: string[];
   secrets: Record<string, SecretBinding>;
@@ -166,6 +173,10 @@ export function loadConfig(
     timeoutMs: overrides.timeoutMs ?? number(env, 'BUJB_TIMEOUT_MS', 300_000),
     maxCostUsd: overrides.maxCostUsd ?? number(env, 'BUJB_MAX_COST_USD', 1),
     cellTimeoutMs: number(env, 'BUJB_CELL_TIMEOUT_MS', 30_000),
+    verification: {
+      minConfidence: ratio(env, 'BUJB_VERIFY_MIN_CONFIDENCE', 0.8),
+      minProbability: ratio(env, 'BUJB_VERIFY_MIN_PROBABILITY', 0.8),
+    },
     telemetry: flag(env, 'BUJB_TELEMETRY', false),
     recording: overrides.record ?? flag(env, 'BUJB_RECORD', false),
     highlightActions: flag(env, 'BUJB_HIGHLIGHT', false),
@@ -184,6 +195,14 @@ function splitList(raw: string | undefined): string[] {
     .split(',')
     .map((entry) => entry.trim())
     .filter(Boolean);
+}
+
+/** A threshold in [0, 1]. An out-of-range or unparsable value falls back. */
+function ratio(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
+  const raw = env[name];
+  if (!raw || !raw.trim()) return fallback;
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1 ? parsed : fallback;
 }
 
 function number(env: NodeJS.ProcessEnv, name: string, fallback: number): number {
@@ -236,6 +255,7 @@ export function describeConfig(config: BridgeConfig): Record<string, unknown> {
       namedSecrets: Object.keys(config.secrets).map((name) => ({ name, value: 'set' })),
     },
     thresholds: config.thresholds,
+    verification: config.verification,
     environment: {
       OPENROUTER_API_KEY: state(process.env['OPENROUTER_API_KEY']),
       BROWSER_USE_API_KEY: state(process.env['BROWSER_USE_API_KEY']),
@@ -245,4 +265,141 @@ export function describeConfig(config: BridgeConfig): Record<string, unknown> {
       HOME: homedir() ? 'set' : 'unset',
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// .env support
+// ---------------------------------------------------------------------------
+
+export interface DotEnvResult {
+  /** Absolute path that was looked at. */
+  path: string;
+  /** False when the file does not exist. */
+  found: boolean;
+  /** Names (never values) of variables taken from the file. */
+  applied: string[];
+  /** Names already present in the process environment, which always win. */
+  skipped: string[];
+  /** 1-based line numbers that could not be parsed. */
+  malformedLines: number[];
+}
+
+/**
+ * Minimal, dependency-free `.env` reader.
+ *
+ * Deliberately *not* Node's `process.loadEnvFile`: this one guarantees the
+ * precedence the project documents — a variable already present in the
+ * process environment is never overwritten — and it reports which names it
+ * set so `doctor` can show provenance without ever touching a value.
+ *
+ * Supported: `KEY=value`, `export KEY=value`, single- or double-quoted values
+ * (with `\n` escapes inside double quotes), `#` comments, blank lines.
+ * Not supported, on purpose: variable interpolation and command substitution.
+ */
+export function parseDotEnv(text: string): { entries: Map<string, string>; malformedLines: number[] } {
+  const entries = new Map<string, string>();
+  const malformedLines: number[] = [];
+  const lines = text.split(/\r?\n/);
+  for (let index = 0; index < lines.length; index++) {
+    const raw = (lines[index] ?? '').trim();
+    if (!raw || raw.startsWith('#')) continue;
+    const withoutExport = raw.startsWith('export ') ? raw.slice('export '.length).trim() : raw;
+    const separator = withoutExport.indexOf('=');
+    if (separator <= 0) {
+      malformedLines.push(index + 1);
+      continue;
+    }
+    const key = withoutExport.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      malformedLines.push(index + 1);
+      continue;
+    }
+    let value = withoutExport.slice(separator + 1).trim();
+    if (value.length >= 2 && value.startsWith('"') && value.endsWith('"')) {
+      value = value.slice(1, -1).replace(/\\n/g, '\n').replace(/\\"/g, '"');
+    } else if (value.length >= 2 && value.startsWith("'") && value.endsWith("'")) {
+      value = value.slice(1, -1);
+    } else {
+      const comment = value.indexOf(' #');
+      if (comment >= 0) value = value.slice(0, comment).trim();
+    }
+    entries.set(key, value);
+  }
+  return { entries, malformedLines };
+}
+
+/**
+ * Load `<dir>/.env` into `env`, without overwriting anything already set.
+ * Returns names only — never a value, and never anything that could be logged
+ * back out as a credential.
+ */
+export function applyDotEnv(dir: string = process.cwd(), env: NodeJS.ProcessEnv = process.env): DotEnvResult {
+  const path = resolve(dir, '.env');
+  const result: DotEnvResult = { path, found: false, applied: [], skipped: [], malformedLines: [] };
+  if (!existsSync(path)) return result;
+  result.found = true;
+  let text: string;
+  try {
+    text = readFileSync(path, 'utf8');
+  } catch {
+    return result;
+  }
+  const { entries, malformedLines } = parseDotEnv(text);
+  result.malformedLines = malformedLines;
+  for (const [key, value] of entries) {
+    if (env[key] !== undefined) {
+      result.skipped.push(key);
+      continue;
+    }
+    env[key] = value;
+    result.applied.push(key);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// Provider credentials
+// ---------------------------------------------------------------------------
+
+/**
+ * Which environment variables can supply a key for a Pi model id.
+ *
+ * Pi model ids are `provider/model…` (e.g. `openrouter/openai/gpt-5.6-luna`).
+ * `@earendil-works/pi-ai` has an authoritative `findEnvKeys()`, but it is not
+ * reachable through that package's `exports` map, and this project does not
+ * import private module paths. So this is a local table. It can drift from
+ * upstream; when a provider is unknown, the conventional
+ * `<PROVIDER>_API_KEY` is assumed and `doctor` says the check is a guess.
+ */
+const PROVIDER_ENV: Record<string, string[]> = {
+  openrouter: ['OPENROUTER_API_KEY'],
+  openai: ['OPENAI_API_KEY'],
+  anthropic: ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_OAUTH_TOKEN'],
+  google: ['GEMINI_API_KEY', 'GOOGLE_API_KEY'],
+  groq: ['GROQ_API_KEY'],
+  xai: ['XAI_API_KEY'],
+  deepseek: ['DEEPSEEK_API_KEY'],
+  mistral: ['MISTRAL_API_KEY'],
+  cerebras: ['CEREBRAS_API_KEY'],
+  together: ['TOGETHER_API_KEY'],
+  fireworks: ['FIREWORKS_API_KEY'],
+  zai: ['ZAI_API_KEY'],
+  moonshot: ['MOONSHOT_API_KEY'],
+};
+
+export interface ProviderCredential {
+  provider: string;
+  candidates: string[];
+  present: string[];
+  known: boolean;
+}
+
+export function providerCredential(modelId: string, env: NodeJS.ProcessEnv = process.env): ProviderCredential {
+  const provider = (modelId.split('/')[0] ?? '').trim().toLowerCase();
+  const known = Object.hasOwn(PROVIDER_ENV, provider);
+  const candidates = known
+    ? (PROVIDER_ENV[provider] as string[])
+    : [`${provider.toUpperCase().replace(/[^A-Z0-9]/g, '_')}_API_KEY`];
+  const present = candidates.filter((name) => Boolean(env[name] && env[name]!.trim()));
+  return { provider, candidates, present, known };
 }

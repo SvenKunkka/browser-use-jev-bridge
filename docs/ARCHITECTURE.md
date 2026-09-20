@@ -1,5 +1,10 @@
 # Architecture
 
+> **Changed in the acceptance-fix pass:** the Pi fallback is now **terminal**
+> (one-way), the Pi approval hook is actually installed, and one budget covers
+> the whole run. Sections below reflect that; see `docs/ACCEPTANCE.md` for what
+> was wrong before.
+
 ## The one rule everything else follows
 
 **Browser Use Pi owns the browser.** One `BrowserUse` instance is created per
@@ -52,10 +57,11 @@ concurrently.
 
 | Path | Responsibility |
 | --- | --- |
-| `src/cli.ts` | `run` / `verify` / `doctor`, flag parsing, exit codes. No credential ever arrives as a flag. |
+| `src/cli.ts` | `run` / `verify` / `doctor`, strict flag parsing, `.env` loading, readiness, exit codes. No credential ever arrives as a flag. |
+| `src/budget.ts` | One `BudgetTracker` per run: Jev steps, Pi steps, wall clock, cost. |
 | `src/config.ts` | Environment → `BridgeConfig`; `describeConfig()` produces a printable form where every secret collapses to `set`/`unset`. |
 | `src/pi/session.ts` | The single owner. Wraps `BrowserUse`; exposes `evaluateInPage`, `cdp`, `cdpBatch`, `goto`, `info`, `tabCount`, `run`, `followUp`, `close`. |
-| `src/pi/fallback.ts` | Renders the handoff, runs the Pi leg under a budget, and supplies the `beforeToolCall` inspection hook. |
+| `src/pi/fallback.ts` | `PiApprovalController` (the `beforeToolCall` hook, typed from `BrowserUse.create`), the handoff render, and the Pi leg under the *remaining* budget. |
 | `src/jev/snapshot.ts` | The in-page sources: full observation, marker, node guard, pre-input target resolution, post-input settle. |
 | `src/jev/action-space.ts` | One index per element; one target set per operation. |
 | `src/jev/policy.ts` | One TypeSafe request per step; strict validation of both heads. |
@@ -65,7 +71,7 @@ concurrently.
 | `src/router/hybrid-router.ts` | The loop, the routing rules, the counters, the budgets. |
 | `src/router/handoff.ts` | `HandoffContext`, `mustNotRepeat`, the literal fallback prompt. |
 | `src/safety/*` | Domain policy, risk classification and approval gates, redaction. |
-| `src/verification/verifier.ts` | Deterministic checks plus one independent model verdict. |
+| `src/verification/verifier.ts` | Deterministic checks plus one independent verification *call*, with confidence and probability thresholds. |
 | `src/logging/audit-log.ts` | Redacted JSONL, written synchronously. |
 | `src/testing/harness.ts` | Offline harness: headless Chromium, a Pi session with a throwing model transport, scripted TypeSafe/text clients. |
 
@@ -114,13 +120,65 @@ concurrently.
 | Three consecutive non-WAIT actions with no page change | Pi |
 | A credential-like field must be filled | Pi (named secret injection only) |
 | No valid decision could be produced | Pi |
-| Step budget reached | Pi once, then a safe stop |
+| Jev's own step ceiling reached | Pi |
+| Global budget exhausted | Safe stop with `step_limit` / `timeout` / `cost_limit` |
 | `--mode fast` and any of the above | Safe stop, never a guess |
 
-After a Pi leg the router **always** re-observes. The new observation produces a
-new fingerprint and new node ids; any decision from before the handoff is dead
-by construction, because a decision only executes against the fingerprint it
-was made on.
+## Jev → Pi is one-way
+
+Handing a step to Pi **ends the run**. The router re-observes the page, runs the
+verifier against that fresh observation, and returns. Control is not handed
+back to the fast path.
+
+This is a deliberate safety choice, not an oversight. Pi's tool is "execute
+this JavaScript": a single cell can click, type and submit several times, and
+this project cannot currently enumerate those individual browser actions. That
+means it cannot populate `mustNotRepeat` for them. Handing control back to a
+policy that would then plan its own next click, without knowing what Pi already
+did, is exactly the "never repeat an action that may already have taken effect"
+rule being broken. So the run stops instead.
+
+`history` therefore contains one record per Pi leg, labelled with the number of
+Pi steps and an explicit note that the individual browser actions are not
+enumerated. It is not a list of what Pi clicked.
+
+Restoring a two-way handoff needs real evidence, not a code change: every
+click, keystroke and submission Pi performs must produce an `ActionRecord`,
+effect-uncertain ones must reach `mustNotRepeat`, and an integration test must
+show that Jev does not repeat them. Until that exists, the fallback stays
+terminal.
+
+## Approval, on both legs
+
+| | Jev fast path | Browser Use Pi fallback |
+| --- | --- | --- |
+| What is gated | one resolved element, with its label, role and link target | one tool call, by name and validated arguments |
+| Default mode | high-risk actions need a human; no human ⇒ refused | the stated **goal** is assessed before the leg starts, and each high-risk tool call is assessed again; no human ⇒ refused |
+| `--review` | every action | every tool call, including the delivery call |
+| On refusal | nothing is dispatched; run ends `stopped_by_approval` (exit 3) | the call is blocked with `terminate: true`, the leg is aborted, run ends `stopped_by_approval` (exit 3) |
+
+The hook is `PiApprovalController.hook`, whose type is derived from
+`Parameters<typeof BrowserUse.create>[0]['beforeToolCall']`. It is passed to
+`BrowserUse.create` — the only place Pi accepts it — and it reads Pi 0.1.0's
+real context: `context.toolCall.name` and `context.args`.
+`tests/integration.pi-fallback.test.ts` drives the actual Pi agent loop and
+asserts that shape at runtime.
+
+## One budget for the whole run
+
+`BudgetTracker` holds the limits and the spend:
+
+- Jev reports one step per executed action.
+- A Pi leg is offered `remaining()`, never the initial limits, and afterwards
+  reports the `steps` and `usage.cost.total` it actually consumed.
+- The wall clock is enforced with an `AbortSignal`, so an in-flight Pi run is
+  cut off at the deadline rather than at the top of the next loop iteration.
+- Exhaustion maps to `timeout`, `cost_limit` or `step_limit`, in that order.
+- `RunOutcome.budget` and the audit log carry limits, used and remaining.
+
+Cost accounting covers the Pi legs only: the TypeSafe and text-model endpoints
+do not return a price, so fast-path calls consume steps and time but contribute
+0 to the cost total.
 
 ## Why a decision cannot be executed twice
 
@@ -158,7 +216,8 @@ was made on.
    (`navigator.userAgentData.platform`), because Pi may be driving a browser on
    another machine.
 6. **Budgets.** Upstream's demo budget (`MAX_STEPS = 60`) survives as
-   `thresholds.jevMaxSteps`; the run-level budget is separate and operator-set.
+   `thresholds.jevMaxSteps`; the run-level budget is separate, operator-set and
+   shared with the Pi legs.
 
 ## Known upstream-vs-prompt differences
 
@@ -174,3 +233,11 @@ was resolved in favour of the live source:
   from `sensitiveData` are added to it automatically.
 - Jev is a Python project. Nothing of it runs at runtime here; it is ported to
   TypeScript, and there is no second process.
+- `findEnvKeys()` in `@earendil-works/pi-ai` would be the authoritative
+  provider→environment-variable map, but that module is not in the package's
+  `exports`, and this project does not import private paths. `doctor` therefore
+  uses a local table (`PROVIDER_ENV` in `src/config.ts`) and says so when a
+  provider is not in it.
+- `@browser_use/pi`'s `exports` map has no `require` condition and does not
+  expose `./package.json`, so `doctor` locates the manifest by walking up to
+  `node_modules/@browser_use/pi/package.json` rather than resolving it.

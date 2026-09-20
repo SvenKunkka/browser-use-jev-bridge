@@ -7,9 +7,15 @@ description: Drive a browser with a fast decision policy in front of a Browser U
 
 A hybrid browser tool. A fast policy handles ordinary HTML controls in one
 model call per step; anything it cannot model is handed to a general-purpose
-Browser Use Pi agent running in the **same** browser session. A run is reported
-as complete only when an independent verifier confirms it from a fresh page
-observation.
+Browser Use Pi agent running in the **same** browser session.
+
+**The handoff is one-way.** Once Pi takes over, the run re-observes, verifies
+and ends. It does not go back to the fast path. Expect at most one Pi leg per
+run, and treat `piFallbacks: 1` as "the run finished inside Pi".
+
+A run is reported complete only when a separate verification call confirms it
+from a page observed *after* the completion claim, with confidence and
+probability above the configured thresholds.
 
 ## When to call this tool
 
@@ -62,9 +68,17 @@ Always pass `--review` — and stay at the terminal — when the task touches:
 - an approval or consent flow;
 - a file upload.
 
-Without `--review` the run does not silently proceed: high-risk actions are
-refused and the run exits with code 3. That is the intended behaviour, not a
-failure to work around.
+Without `--review` the run does not silently proceed. Three things are gated:
+
+- a **goal** about buying, paying, sending, publishing, deleting, approving or
+  uploading is refused *before* Pi is even started;
+- a high-risk action on the fast path is refused;
+- a high-risk Pi tool call is refused, the leg is aborted, and the page is left
+  as it was.
+
+Each of these exits with code 3. That is the intended behaviour, not a failure
+to work around. With `--review`, every fast-path action **and** every Pi tool
+call is shown before it runs.
 
 ## Reading the result
 
@@ -75,7 +89,7 @@ Exit codes:
 | 0 | Goal reached **and** independently verified | Report success; quote `finalUrl` and the verifier's evidence |
 | 1 | Finished without verified success (`unverified`, `blocked`, `step_limit`, `timeout`, `error`) | Report honestly; do not claim the task is done |
 | 2 | Usage error | Fix the invocation |
-| 3 | A high-risk action needed approval and none was available | Tell the user which action, and offer to re-run with `--review` |
+| 3 | An action (or the goal itself) needed approval and none was available | Tell the user exactly what was refused, and offer to re-run with `--review` |
 | 4 | Environment problem | Run `bu-fast doctor` |
 
 **Only exit code 0 means the task is done.** `status: "completed"` always comes
@@ -85,29 +99,38 @@ already looked at the final page and declined to say so.
 
 ## Handling failure
 
-- `blocked` — the page needs something neither policy could do, or the fallback
-  budget ran out. Read `fallbackReasons` and `notes`, then either narrow the
-  goal or do the step manually.
+- `blocked` — the page needs something neither policy could do. Read
+  `fallbackReasons` and `notes`, then either narrow the goal or do the step
+  manually.
+- `step_limit` / `timeout` / `cost_limit` — the one run-wide budget ran out.
+  `budget` in the result shows limits, used and remaining. Partial work may
+  exist: inspect the page, do not re-run blindly.
 - `unverified` — an action may well have happened; the *evidence* was missing.
   Re-read the final page before doing anything else, and never re-run the same
   goal blindly: a re-run can repeat an action that already took effect.
 - `stopped_by_approval` — nothing was dispatched. Safe to re-run with
   `--review`.
-- `timeout` / `step_limit` — partial work may exist. Inspect, do not replay.
-
-In every failure case the `history` array lists what actually reached the
-browser. Treat it, not the model's narration, as the record.
+In every failure case the `history` array lists what the **fast path**
+dispatched. A Pi leg appears as a single record with its step count and an
+explicit note that the individual browser actions are not enumerated — so if a
+run ended inside Pi, re-read the live page before doing anything else. Never
+assume `history` tells you what Pi clicked.
 
 ## Before the first run
 
 ```
-bu-fast doctor --json
+bu-fast doctor --mode hybrid --json
 ```
 
-It reports Node version, the `@browser_use/pi` version, Chrome availability and
-remote-debugging status, whether each required environment variable is `set` or
-`unset` (never the value), the configured endpoints, workspace writability and
+It returns `ready`, `partial` or `not_ready` for the mode you name, with a
+`blockers` list, and exits 4 on `not_ready`. It reports the Node version, the
+`@browser_use/pi` version, Chrome availability and remote-debugging status,
+whether each credential is `set` or `unset` (never the value), the configured
+endpoints, workspace writability, whether `.env` was loaded (names only), and
 the current telemetry/recording settings.
+
+Do not start a run when `doctor` says `not_ready`; tell the user what the
+blockers are.
 
 ## Audit
 

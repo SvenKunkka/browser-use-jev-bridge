@@ -63,7 +63,7 @@ test('requirement 6 — three actions with no page change hand the task to Pi', 
   const fallback = new FakeFallback();
   const { router, executor } = buildRouter({
     snapshots: [snapshot],
-    script: [CLICK_E1, CLICK_E1, CLICK_E1, DONE, SATISFIED],
+    script: [CLICK_E1, CLICK_E1, CLICK_E1, SATISFIED],
     fallback,
   });
 
@@ -81,11 +81,11 @@ test('requirement 7 — BLOCKED hands the task to Pi instead of guessing', async
   const fallback = new FakeFallback();
   const { router, executor } = buildRouter({
     snapshots: [makeSnapshot()],
-    script: [BLOCKED, DONE, SATISFIED],
+    script: [BLOCKED, SATISFIED],
     fallback,
   });
 
-  const outcome = await router.run('upload the contract', 'https://example.com/list');
+  const outcome = await router.run('open the embedded report', 'https://example.com/list');
 
   assert.equal(executor.executed.length, 0, 'nothing is executed on BLOCKED');
   assert.equal(fallback.calls.length, 1);
@@ -99,7 +99,7 @@ test('requirement 7 — BLOCKED with no fallback available stops instead of cont
     script: [BLOCKED, NOT_SATISFIED],
     config: { mode: 'fast' },
   });
-  const outcome = await router.run('upload the contract', 'https://example.com/list');
+  const outcome = await router.run('open the embedded report', 'https://example.com/list');
   assert.equal(outcome.status, 'blocked');
   assert.equal(executor.executed.length, 0);
   assert.equal(outcome.verification.verified, false);
@@ -114,7 +114,7 @@ test('two consecutive stale decisions hand the task to Pi', async () => {
   const router = new HybridRouter({
     backend: new FakeBackend(),
     executor,
-    typeSafe: new ScriptedTypeSafeClient([CLICK_E1, CLICK_E1, DONE, SATISFIED]),
+    typeSafe: new ScriptedTypeSafeClient([CLICK_E1, CLICK_E1, SATISFIED]),
     textModel: new MissingTextModelClient(),
     fallback,
     gate: new DenyHighRiskGate(),
@@ -133,16 +133,20 @@ test('two consecutive stale decisions hand the task to Pi', async () => {
   assert.match(fallback.calls[0]!.fallbackReason, /changed underneath two consecutive decisions/i);
 });
 
-test('requirement 12 — control returns to Jev only through a fresh observation', async () => {
+test('requirement 12 — the Pi fallback is terminal: re-observe, verify, stop', async () => {
   const before = makeSnapshot({ text: 'before fallback' });
   const after = makeSnapshot({ text: 'after fallback' });
   const fallback = new FakeFallback();
   const executor = new FakeExecutor([before, after]);
   const audit = new MemoryAuditLog(new Redactor(), 'router-test');
+  // Only two script entries exist: the BLOCKED decision and the verifier's
+  // verdict. If the router tried to hand control back to Jev it would ask for
+  // a third decision and the scripted client would throw.
+  const typeSafe = new ScriptedTypeSafeClient([BLOCKED, SATISFIED]);
   const router = new HybridRouter({
     backend: new FakeBackend(),
     executor,
-    typeSafe: new ScriptedTypeSafeClient([BLOCKED, DONE, SATISFIED]),
+    typeSafe,
     textModel: new MissingTextModelClient(),
     fallback,
     gate: new DenyHighRiskGate(),
@@ -157,15 +161,29 @@ test('requirement 12 — control returns to Jev only through a fresh observation
   const types = audit.entries.map((entry) => entry['type']);
   const fallbackEnd = types.lastIndexOf('fallback_end');
   const observationAfter = types.indexOf('observation', fallbackEnd);
-  const decisionAfter = types.indexOf('decision', fallbackEnd);
   assert.ok(fallbackEnd >= 0, 'fallback ran');
   assert.ok(observationAfter > fallbackEnd, 'the page is re-observed after the fallback');
-  assert.ok(decisionAfter === -1 || decisionAfter > observationAfter, 'no decision is taken before re-observing');
+  assert.equal(
+    types.indexOf('decision', fallbackEnd),
+    -1,
+    'no further Jev decision is taken after the fallback — the leg is terminal',
+  );
+  assert.equal(outcome.piFallbacks, 1);
+  assert.equal(fallback.calls.length, 1);
 
   const piRecord = outcome.history.find((record) => record.source === 'pi');
   assert.ok(piRecord, 'the fallback leg is recorded in history');
   assert.equal(piRecord!.fingerprintAfter, after.fingerprint);
   assert.equal(piRecord!.pageChanged, true);
+  assert.match(
+    piRecord!.label,
+    /individual browser actions are not enumerated/,
+    'the record must not imply Pi\'s internal actions were captured',
+  );
+  assert.ok(
+    outcome.notes.some((note) => /terminal/i.test(note)),
+    'the outcome states that the fallback was terminal',
+  );
 });
 
 test('requirement 13 — a DONE claim that fails verification is never reported as completed', async () => {

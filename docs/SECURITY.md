@@ -28,6 +28,10 @@ The layers below are what stand between that and a consequential action.
 
 - Every key is read from the environment. **No CLI flag accepts a credential**,
   so nothing lands in shell history or a process listing.
+- The `bu-fast` CLI loads `./.env` at startup. A variable already present in
+  the process environment always wins; the file never overrides it. The
+  library entry point does not load `.env` implicitly — call `applyDotEnv()`.
+  The loader reports the *names* it applied and skipped, never a value.
 - `.env` is git-ignored; `.env.example` is the template and contains no values.
 - The audit log, CLI output, `doctor` output and every error message pass
   through `Redactor`, which masks (a) every registered secret value and
@@ -73,18 +77,44 @@ Chinese.
 - `--review` is rejected outright when stdin is not a TTY or `--json` is set,
   rather than silently degrading to "approve everything".
 
-**Honest limitation.** On the Jev side, approval gates a specific, resolved
-element. On the Pi side, the tool is "run this JavaScript", so the gate is a
-code inspection (`buildBeforeToolCall`) plus a prohibition stated in the
-handoff prompt. A determined model could express a high-risk action in code the
-pattern does not match. If you need a hard guarantee for a given site, use
-`--prohibited-domain`, or run in `--mode fast`, where there is no fallback.
+### On the Pi leg
+
+The hook is real and installed. `PiApprovalController.hook` is handed to
+`BrowserUse.create` (the only place Pi accepts `beforeToolCall`), its type is
+derived from that call's own parameter type, and it reads Pi 0.1.0's actual
+context — `context.toolCall.name` and `context.args`. A refusal returns
+`{ block: true, terminate: true }` *and* aborts the leg, so the model cannot
+simply reword the action on its next turn. The run then ends
+`stopped_by_approval` with exit code 3.
+
+Three layers apply, in order:
+
+1. **Intent, before the leg starts.** The operator's goal is risk-assessed
+   before Pi is given anything. A goal about buying, paying, sending,
+   deleting, publishing, approving or uploading needs a human first — no
+   generated code is required for this to trigger.
+2. **Every tool call, in `--review`.** Not only pattern matches: every call,
+   including `finish`.
+3. **High-risk tool calls, always.** A code-shape backstop on the cell's
+   source.
+
+**Honest limitation.** Layer 3 is a pattern match over generated JavaScript, so
+a determined model could express a consequential action in code it does not
+catch. Layers 1 and 2 do not depend on pattern matching, which is why they
+exist. For a hard guarantee on a given site, use `--prohibited-domain`, or run
+`--mode fast`, where there is no fallback at all.
+
+**What is not claimed.** This project does not enumerate the individual browser
+actions inside a Pi cell. `history` records one entry per Pi leg, and
+`mustNotRepeat` covers Jev actions only. That is also why the fallback is
+terminal — see `docs/ARCHITECTURE.md`.
 
 ## Not repeating actions
 
-Every dispatched action that could have taken effect is recorded before the
-next observation and is carried into any handoff under `mustNotRepeat`,
-including actions where no page change was observed. Failure never triggers an
+Every **Jev** action that could have taken effect is recorded before the next
+observation and is carried into the handoff under `mustNotRepeat`, including
+actions where no page change was observed. Pi's internal actions are *not*
+enumerated, which is precisely why control never returns to Jev afterwards. Failure never triggers an
 automatic replay: a stale page means observe again, an unsafe action means hand
 over, and a rejected CDP call is treated as *possibly executed*.
 
@@ -98,9 +128,31 @@ staleness, handoffs, verification and the final status.
 status must carry `verified: true`, and the file must contain no
 credential-shaped strings.
 
+## Budgets
+
+One `BudgetTracker` covers the whole run — Jev steps, Pi steps, wall clock and
+model cost. A fallback leg is offered only what is left, never the initial
+limits, and the deadline is enforced with an `AbortSignal` so an in-flight Pi
+run is cut off rather than noticed late. Cost accounting covers the Pi legs;
+the fast path's two endpoints do not report a price.
+
 ## Reporting
 
 There is no completion claim without evidence. `status: "completed"` is emitted
-only when the independent verifier returns `SATISFIED` from a fresh
-observation taken after the claim. Everything else is `unverified`, `blocked`,
-`stopped_by_approval`, `step_limit`, `timeout` or `error`.
+only when **all** of the following hold:
+
+1. the verdict is `SATISFIED`;
+2. every deterministic check passed;
+3. the answer's confidence is at least `BUJB_VERIFY_MIN_CONFIDENCE` (0.80);
+4. the probability mass on `SATISFIED` is at least
+   `BUJB_VERIFY_MIN_PROBABILITY` (0.80);
+5. the observation used was taken *after* the completion claim.
+
+Everything else is `unverified`, `blocked`, `stopped_by_approval`,
+`step_limit`, `timeout`, `cost_limit` or `error`.
+
+The verification call is an **independent call**, not an independent model: it
+goes to the same TypeSafe provider and model id as the decision heads, and is
+shown only the goal and a fresh page. A systematic bias in that model is shared
+by both sides. Point a different `TYPESAFE_MODEL` at the verifier if that
+matters for your use.

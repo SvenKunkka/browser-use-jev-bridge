@@ -52,13 +52,24 @@ export interface RiskInput {
   context?: string;
   /** Free text of a Pi fallback instruction or JS cell, when source === 'pi'. */
   code?: string;
+  /**
+   * The operator's stated goal, or the handoff's purpose. Assessed before a
+   * fallback leg starts so a consequential *intent* is caught even when no
+   * generated code has been seen yet.
+   */
+  intent?: string;
 }
 
 export function assessRisk(input: RiskInput): RiskAssessment {
   const reasons: string[] = [];
   let risk: RiskLevel = 'low';
 
-  const haystacks = [input.action?.label ?? '', input.action?.href ?? '', input.code ?? '']
+  const haystacks = [
+    input.action?.label ?? '',
+    input.action?.href ?? '',
+    input.code ?? '',
+    input.intent ?? '',
+  ]
     .filter(Boolean)
     .join('\n');
 

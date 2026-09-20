@@ -7,7 +7,16 @@
  */
 
 export * from './types.js';
-export { loadConfig, describeConfig, registerSecrets, collectSecrets } from './config.js';
+export {
+  loadConfig,
+  describeConfig,
+  registerSecrets,
+  collectSecrets,
+  applyDotEnv,
+  parseDotEnv,
+  providerCredential,
+} from './config.js';
+export type { DotEnvResult, ProviderCredential } from './config.js';
 export type { BridgeConfig, BridgeMode, ConfigOverrides } from './config.js';
 export { Redactor, defaultRedactor } from './safety/redaction.js';
 export { DomainPolicy, DomainBlockedError, hostMatches } from './safety/domains.js';
@@ -42,8 +51,22 @@ export type { JevExecutorPort } from './jev/executor.js';
 export { SNAPSHOT_SOURCE, MARKER_SOURCE, guardSource, actTargetSource, settleSource } from './jev/snapshot.js';
 export { PiSession, browserOptionsFor } from './pi/session.js';
 export type { BrowserBackend, PageInfo } from './pi/session.js';
-export { PiFallbackRunner, UnavailableFallbackRunner, runFallback, buildBeforeToolCall } from './pi/fallback.js';
-export type { FallbackOutcome } from './pi/fallback.js';
+export {
+  PiFallbackRunner,
+  UnavailableFallbackRunner,
+  PiApprovalController,
+  runFallback,
+  describeToolCall,
+} from './pi/fallback.js';
+export type {
+  FallbackOutcome,
+  FallbackBudget,
+  PiBeforeToolCall,
+  PiBeforeToolCallContext,
+  PiDenial,
+} from './pi/fallback.js';
+export { BudgetTracker } from './budget.js';
+export type { BudgetLimits, BudgetReport, BudgetRemaining, BudgetExhaustion } from './budget.js';
 export { HybridRouter, detectUnsupported } from './router/hybrid-router.js';
 export type { RouterDependencies, FallbackRunner } from './router/hybrid-router.js';
 export { buildHandoff, buildMustNotRepeat, renderHandoffPrompt, FALLBACK_REASON_TEXT } from './router/handoff.js';
@@ -62,7 +85,7 @@ import {
   type TextModelClient,
 } from './jev/text-helper.js';
 import { AuditLog } from './logging/audit-log.js';
-import { PiFallbackRunner, UnavailableFallbackRunner } from './pi/fallback.js';
+import { PiApprovalController, PiFallbackRunner, UnavailableFallbackRunner } from './pi/fallback.js';
 import { PiSession } from './pi/session.js';
 import { HybridRouter } from './router/hybrid-router.js';
 import { DenyHighRiskGate, type ApprovalGate } from './safety/approval-policy.js';
@@ -102,7 +125,24 @@ export async function runTask(options: RunTaskOptions): Promise<RunOutcome> {
     : new MissingTextModelClient();
 
   const gate: ApprovalGate = options.gate ?? new DenyHighRiskGate();
-  const session = await PiSession.create({ config, redactor, domainPolicy });
+
+  // The Pi approval hook must exist before the session, because Pi only
+  // accepts `beforeToolCall` at creation time.
+  let currentUrl = url;
+  const controller = new PiApprovalController({
+    gate,
+    redactor,
+    audit,
+    review: config.review,
+    currentUrl: () => currentUrl,
+  });
+
+  const session = await PiSession.create({
+    config,
+    redactor,
+    domainPolicy,
+    ...(config.mode === 'fast' ? {} : { beforeToolCall: controller.hook }),
+  });
   try {
     const executor = new JevExecutor(session);
     const fallback =
@@ -110,22 +150,21 @@ export async function runTask(options: RunTaskOptions): Promise<RunOutcome> {
         ? new UnavailableFallbackRunner()
         : new PiFallbackRunner({
             session,
-            gate,
             redactor,
-            budget: {
-              maxSteps: Math.max(1, config.maxSteps),
-              timeoutMs: config.timeoutMs,
-              maxCostUsd: config.maxCostUsd,
-            },
+            controller,
             ...(options.signal ? { signal: options.signal } : {}),
           });
 
     const router = new HybridRouter({
       backend: session,
+      onUrlChange: (next) => {
+        currentUrl = next;
+      },
       executor,
       ...(typeSafe ? { typeSafe } : {}),
       textModel,
       fallback,
+      piController: controller,
       gate,
       redactor,
       domainPolicy,

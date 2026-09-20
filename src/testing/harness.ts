@@ -142,12 +142,20 @@ export interface OfflineSession {
   close(): Promise<void>;
 }
 
-/** Real Pi session, real Chrome, no model provider reachable. */
+/**
+ * Real Pi session, real Chrome, no model provider reachable.
+ *
+ * Pass `streamFn` to drive Pi's agent loop deterministically, and
+ * `beforeToolCall` to attach the approval hook exactly as production does.
+ * With no `streamFn`, any attempt by Pi to reach a provider throws.
+ */
 export async function createOfflinePiSession(options: {
   cdpUrl: string;
   workspace: string;
   allowedDomains?: string[];
   prohibitedDomains?: string[];
+  beforeToolCall?: PiBeforeToolCall;
+  streamFn?: unknown;
 }): Promise<OfflineSession> {
   const config = loadConfig(
     {
@@ -174,7 +182,8 @@ export async function createOfflinePiSession(options: {
     config,
     redactor,
     domainPolicy,
-    streamFn: streamFn as never,
+    ...(options.beforeToolCall ? { beforeToolCall: options.beforeToolCall } : {}),
+    streamFn: (options.streamFn ?? streamFn) as never,
   });
   return {
     session,
@@ -249,6 +258,8 @@ export interface LabelStep {
   operation?: string;
   targetLabel?: string;
   verdict?: string;
+  /** Override the answer's confidence, for testing the verifier's thresholds. */
+  confidence?: number;
 }
 
 function distribute(ids: string[], choice: string): Record<string, number> {
@@ -272,7 +283,11 @@ export class LabelDrivenTypeSafeClient implements TypeSafeClient {
 
     if (step.verdict && body.questions['verdict']) {
       const ids = Object.keys((body.questions['verdict'] as { criteria: Record<string, unknown> }).criteria);
-      answers['verdict'] = { choice: step.verdict, confidence: 0.95, probabilities: distribute(ids, step.verdict) };
+      answers['verdict'] = {
+        choice: step.verdict,
+        confidence: step.confidence ?? 0.95,
+        probabilities: distribute(ids, step.verdict),
+      };
       return { answers, model: 'label-driven' };
     }
 
@@ -311,4 +326,124 @@ export class LabelDrivenTypeSafeClient implements TypeSafeClient {
     }
     return { answers, model: 'label-driven' };
   }
+}
+
+// ---------------------------------------------------------------------------
+// Pi approval-hook test support
+// ---------------------------------------------------------------------------
+
+import type { PiBeforeToolCall, PiBeforeToolCallContext } from '../pi/fallback.js';
+
+/**
+ * A `BeforeToolCallContext` shaped exactly like the one Pi 0.1.0 passes.
+ *
+ * The field names here are not guesses: `PiBeforeToolCallContext` is derived
+ * from `BrowserUse.create`'s own parameter type, so if upstream renames
+ * `args` or `toolCall`, this stops compiling. The *runtime* proof that Pi
+ * really passes this shape is in tests/integration.pi-fallback.test.ts, where
+ * Pi itself invokes the hook.
+ */
+export function makePiToolCallContext(name: string, args: unknown, id = 'call_1'): PiBeforeToolCallContext {
+  const assistantMessage = {
+    role: 'assistant' as const,
+    content: [{ type: 'toolCall' as const, id, name, arguments: (args ?? {}) as Record<string, unknown> }],
+    api: 'openai-completions',
+    provider: 'openai',
+    model: 'test',
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason: 'toolUse' as const,
+    timestamp: Date.now(),
+  };
+  return {
+    assistantMessage,
+    toolCall: assistantMessage.content[0],
+    args,
+    context: { messages: [], tools: [], systemPrompt: '' },
+  } as unknown as PiBeforeToolCallContext;
+}
+
+// ---------------------------------------------------------------------------
+// A deterministic stand-in for Pi's model transport
+// ---------------------------------------------------------------------------
+
+import { createAssistantMessageEventStream } from '@earendil-works/pi-ai/utils/event-stream';
+
+export interface ScriptedPiTurn {
+  /** Emit a tool call; Pi will execute it (subject to beforeToolCall). */
+  toolCall?: { name: string; arguments: Record<string, unknown> };
+  /** Emit plain text and end the turn. */
+  text?: string;
+}
+
+const ZERO_USAGE = {
+  input: 0,
+  output: 0,
+  cacheRead: 0,
+  cacheWrite: 0,
+  totalTokens: 0,
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+};
+
+/**
+ * A `streamFn` that replays a fixed script of assistant turns.
+ *
+ * This is what makes a genuine Pi fallback testable offline: Pi's agent loop,
+ * tool registry, `beforeToolCall` plumbing, V8 cell and CDP path are all the
+ * real thing; only the provider request is replaced. No network, no spend.
+ */
+export function scriptedPiStreamFn(turns: ScriptedPiTurn[]): unknown {
+  let index = 0;
+  const calls: ScriptedPiTurn[] = [];
+  const streamFn = (model: { api: string; provider: string; id: string }) => {
+    const stream = createAssistantMessageEventStream();
+    const turn = turns[index++] ?? { text: 'No further scripted turns.' };
+    calls.push(turn);
+    const base = {
+      role: 'assistant' as const,
+      content: [] as unknown[],
+      api: model.api,
+      provider: model.provider,
+      model: model.id,
+      usage: ZERO_USAGE,
+      stopReason: 'pending' as const,
+      timestamp: Date.now(),
+    };
+
+    if (turn.toolCall) {
+      const toolCall = {
+        type: 'toolCall' as const,
+        id: `scripted_call_${index}`,
+        name: turn.toolCall.name,
+        arguments: turn.toolCall.arguments,
+      };
+      const partial = { ...base, content: [toolCall] };
+      stream.push({ type: 'start', partial } as never);
+      stream.push({ type: 'toolcall_start', contentIndex: 0, partial } as never);
+      stream.push({ type: 'toolcall_end', contentIndex: 0, toolCall, partial } as never);
+      stream.push({
+        type: 'done',
+        reason: 'toolUse',
+        message: { ...partial, stopReason: 'toolUse' },
+      } as never);
+    } else {
+      const text = turn.text ?? '';
+      const partial = { ...base, content: [{ type: 'text' as const, text }] };
+      stream.push({ type: 'start', partial } as never);
+      stream.push({ type: 'text_start', contentIndex: 0, partial } as never);
+      stream.push({ type: 'text_delta', contentIndex: 0, delta: text, partial } as never);
+      stream.push({ type: 'text_end', contentIndex: 0, content: text, partial } as never);
+      stream.push({ type: 'done', reason: 'stop', message: { ...partial, stopReason: 'stop' } } as never);
+    }
+    stream.end();
+    return stream;
+  };
+  (streamFn as { scriptedCalls?: ScriptedPiTurn[] }).scriptedCalls = calls;
+  return streamFn;
 }

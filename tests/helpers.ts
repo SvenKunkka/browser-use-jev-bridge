@@ -5,8 +5,8 @@ import { fingerprintSnapshot } from '../src/jev/freshness.js';
 import type { JevExecutorPort } from '../src/jev/executor.js';
 import type { BrowserBackend, PageInfo } from '../src/pi/session.js';
 import type { FallbackRunner } from '../src/router/hybrid-router.js';
-import type { FallbackOutcome } from '../src/pi/fallback.js';
-import type { HandoffContext, JevRawAction, JevSnapshot, UnsupportedSignals } from '../src/types.js';
+import type { FallbackBudget, FallbackOutcome } from '../src/pi/fallback.js';
+import type { HandoffContext, JevRawAction, JevSnapshot, RiskAssessment, UnsupportedSignals } from '../src/types.js';
 
 export const NO_UNSUPPORTED: UnsupportedSignals = {
   iframes: 0,
@@ -65,6 +65,9 @@ export class FakeExecutor implements JevExecutorPort {
 
   async observe(): Promise<JevSnapshot> {
     const next = this.queue.length > 1 ? this.queue.shift()! : this.queue[0]!;
+    // Stamp the observation like the real executor does, so freshness checks
+    // that compare against a claim timestamp behave as they do in production.
+    next.observedAt = Date.now();
     this.observations.push(next);
     return next;
   }
@@ -107,18 +110,32 @@ export class FakeBackend implements BrowserBackend {
 export class FakeFallback implements FallbackRunner {
   readonly available = true;
   readonly calls: HandoffContext[] = [];
+  readonly budgets: FallbackBudget[] = [];
   constructor(private readonly outcome: Partial<FallbackOutcome> = {}) {}
-  async run(context: HandoffContext): Promise<FallbackOutcome> {
+  async run(context: HandoffContext, budget: FallbackBudget): Promise<FallbackOutcome> {
     this.calls.push(context);
+    this.budgets.push(budget);
     return {
       status: 'completed',
       text: 'fallback finished',
       steps: 1,
       durationMs: 5,
+      costUsd: 0,
       blockedActions: [],
       ...this.outcome,
     };
   }
+}
+
+/** A controller stand-in that reports a denial the router must honour. */
+export function deniedController(toolName = 'javascript', reason = 'operator declined') {
+  return {
+    denial: {
+      toolName,
+      reason,
+      risk: { risk: 'high', reasons: ['test'], requiresApproval: true } as RiskAssessment,
+    },
+  };
 }
 
 export function testConfig(overrides: Partial<BridgeConfig> = {}): BridgeConfig {
