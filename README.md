@@ -47,7 +47,7 @@ test suite, including the browser integration tests, runs offline.
 ## Install from zero
 
 ```sh
-git clone <this repository> browser-use-jev-bridge
+git clone https://github.com/SvenKunkka/browser-use-jev-bridge.git
 cd browser-use-jev-bridge
 npm install            # installs @browser_use/pi locally; the global copy is untouched
 npm run check          # type-check

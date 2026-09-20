@@ -4,6 +4,14 @@
   "private": true,
   "description": "Hybrid browser tool: Jev-style fast policy in front of a single Browser Use Pi session, with independent verification, approval gating and audit logging.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SvenKunkka/browser-use-jev-bridge.git"
+  },
+  "homepage": "https://github.com/SvenKunkka/browser-use-jev-bridge#readme",
+  "bugs": {
+    "url": "https://github.com/SvenKunkka/browser-use-jev-bridge/issues"
+  },
   "type": "module",
   "engines": {
     "node": ">=22.19"
