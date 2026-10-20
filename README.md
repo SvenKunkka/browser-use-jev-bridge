@@ -1,3 +1,7 @@
+<!-- SVENKUNKKA-README-NAV:BEGIN -->
+[中文项目说明](#project-overview-zh) · [English overview](#project-overview-en) · [维护者 X / Maintainer on X](https://x.com/Svenu1s5)
+<!-- SVENKUNKKA-README-NAV:END -->
+
 # browser-use-jev-bridge
 
 **A Jev-style fast policy in front of a Browser Use Pi fallback, sharing one
@@ -335,3 +339,30 @@ MIT. This project ports MIT-licensed code from
 depends on [`@browser_use/pi`](https://github.com/browser-use/browser-use-pi)
 through its public API. Both licences and a file-by-file statement of what was
 reused are in [`LICENSES/`](LICENSES/NOTICE.md).
+
+
+---
+
+<!-- SVENKUNKKA-PROJECT-INFO:BEGIN -->
+
+<a id="project-overview-zh"></a>
+## 中文项目说明
+
+混合浏览器自动化工具：普通网页控件使用快速策略，复杂操作交给共享会话的 Browser Use Pi，并提供 CLI、MCP、确认门禁、审计日志和独立页面核验。
+
+**使用入口：** 使用 Node.js 22.19 及以上版本，运行 `npm install`、`npm run build`，配置 `.env`；安装与 MCP 接入见 [docs/INSTALL.md](docs/INSTALL.md)。
+
+**范围说明：** 快速策略转交 Pi 后不会返回；Pi 可访问文件系统与网络，工具并非隔离沙箱。浏览器、模型服务及密钥需自行配置。
+
+<a id="project-overview-en"></a>
+## English project overview
+
+A hybrid browser automation tool that uses a fast policy for ordinary HTML controls and hands complex work to Browser Use Pi in the same session, with CLI and MCP interfaces, approval gates, audit logs and independent page verification.
+
+**Getting started:** Use Node.js 22.19 or later, run `npm install` and `npm run build`, then configure `.env`. See [docs/INSTALL.md](docs/INSTALL.md) for installation and MCP integration.
+
+**Scope:** Handoff to Pi is one-way. Pi has filesystem and network access, so this tool is not an isolation sandbox. Browsers, model services and credentials require configuration.
+
+**仓库维护者 / Repository maintainer:** [SvenKunkka](https://github.com/SvenKunkka) · [X / Twitter](https://x.com/Svenu1s5)
+
+<!-- SVENKUNKKA-PROJECT-INFO:END -->
